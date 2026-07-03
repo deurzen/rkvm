@@ -1,95 +1,61 @@
 # rkvm local task board
 
-Priority order is based on expected impact on input latency/perceived speed first, then robustness, then implementation risk.
+Priority order is based on expected impact on input latency/perceived speed first, then robustness, then implementation risk. Tasks are removed before the commit that completes them.
 
-## P0 — Protocol/event-frame batching
+## P0 — Reuse network encode buffers
 
-Status: done
-
-Send input frames as batches instead of one network message per individual event.
+Reduce allocator churn in the hot outbound message path.
 
 Acceptance:
-- Add a protocol update such as `Update::Events { id, events: Vec<Event> }` or equivalent.
-- Server forwards all events belonging to one `SYN_REPORT` frame in one message/flush.
-- Client writes each event in order and preserves sync semantics.
-- Backward compatibility/version handling is considered, or protocol version is intentionally bumped.
-- Validate keyboard and mouse behavior, including key press/release ordering and relative motion.
+- Add a reusable-buffer encode path mirroring `decode_with_buffer`.
+- Keep the existing length-prefixed wire format unchanged.
+- Use the reusable encode path in latency-sensitive client/server loops.
+- Add tests for wire compatibility and buffer capacity reuse.
 
-Notes:
-- Likely biggest throughput and latency win.
-- Needs careful handling around switch-key propagation and local echo path.
+## P1 — Write received input frames to uinput in batches
 
-## P1 — TCP_NODELAY for latency-sensitive sockets
-
-Status: done
-
-Disable Nagle on accepted/connected TCP sockets before TLS wrapping.
+Avoid per-event async readiness overhead when replaying a received `Update::Events` frame.
 
 Acceptance:
-- Server calls `set_nodelay(true)` on accepted `TcpStream`s.
-- Client calls `set_nodelay(true)` after connect.
-- Errors are propagated/logged consistently with existing network errors.
-- Basic client/server connection tests still pass.
+- Add a `Writer` frame/batch write API that preserves event order.
+- Handle partial writes/would-block without duplicating or reordering events.
+- Use the batch API on the client for `Update::Events`.
+- Keep single-event writes available for existing call sites.
 
-Notes:
-- Small, low-risk patch.
-- Should reduce tiny-packet latency and delayed-ACK interactions.
+## P2 — Make heartbeat traffic idle-only
 
-## P2 — Slow-client isolation / bounded backpressure policy
-
-Status: done
-
-Prevent one slow or stuck client from blocking server input processing for everyone.
+Prevent periodic pings from preempting input updates or blocking the per-client writer while waiting for a pong.
 
 Acceptance:
-- Server event loop cannot await indefinitely on a full per-client channel.
-- Slow clients are disconnected on queue overflow without blocking the input loop.
-- Policy is logged clearly.
-- Current active-client switching remains correct after disconnect/removal.
+- Treat any valid update received by the client as server liveness.
+- Server sends pings only after an idle period without queued updates.
+- Waiting for pong must not add avoidable latency to queued input updates.
+- Preserve disconnect detection for idle broken connections.
 
-Notes:
-- Robustness improvement; protects perceived speed under bad network/client conditions.
-- Review slab index handling carefully when removing clients.
+## P3 — Remove hot-path tracing overhead from input reads
 
-## P3 — Built-in client reconnect/backoff
-
-Status: done
-
-Let `rkvm-client` reconnect without relying solely on systemd restart.
+Avoid per-event span construction and dynamic path lookup in `Interceptor::read`.
 
 Acceptance:
-- Client retries connection with bounded/exponential backoff after transient disconnects.
-- Authentication/TLS/version failures remain visible and do not spin aggressively.
-- Existing systemd restart behavior remains acceptable.
-- Logs distinguish initial connect, reconnect attempts, and permanent failures.
+- Remove or reduce per-event `tracing::instrument` overhead.
+- Keep useful registration/error logging intact.
+- Preserve input read behavior exactly.
 
-Notes:
-- Improves non-systemd usage and perceived reliability.
+## P4 — Drain ready evdev events by frame
 
-## P4 — Reduce per-message allocation in network decode path
-
-Status: done
-
-Reduce allocator churn in `rkvm-net::message::Message::decode`.
+Reduce per-event async readiness overhead on input capture.
 
 Acceptance:
-- Explore reusable buffers or a framed codec without complicating API excessively.
-- No change to wire format unless paired with an intentional protocol bump.
-- Bench or reason about allocation reduction after event batching is in place.
+- After readiness, drain available libevdev events until frame completion or would-block.
+- Preserve `SYN_DROPPED` handling and local echo for unrecognized events.
+- Preserve cancel safety for partially written local echo events.
 
-Notes:
-- Lower priority because batching should reduce message count first.
+## P5 — Precompute switch-key membership
 
-## P5 — Whitelist usability/robustness follow-up
-
-Status: done
-
-Make the device whitelist easier and safer to use for keyboard-only forwarding.
+Avoid scanning every configured switch binding for every key event.
 
 Acceptance:
-- Document recommended path-based matching using `/dev/input/by-id/*-event-kbd` or `/dev/input/by-path/*-event-kbd`.
-- Consider a diagnostic mode/log that prints candidate devices with path/name/vendor/product/version.
-- Warn users that vendor/product-only can match multiple event nodes from one physical device/receiver.
-
-Notes:
-- Complements the whitelist patch; mostly docs/UX unless a list-devices command is added.
+- Build a switch-key union set once from configured bindings.
+- Use the precomputed set in the hot routing path.
+- Preserve chord matching and active-binding behavior.
+- Keep existing switch-binding tests passing.
