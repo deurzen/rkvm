@@ -109,4 +109,33 @@ mod test {
             _ => panic!("unexpected update"),
         }
     }
+
+    #[tokio::test]
+    async fn decode_with_buffer_reuses_capacity() {
+        let mut data = Vec::new();
+        Update::Events {
+            id: 7,
+            events: vec![
+                Event::Sync(rkvm_input::sync::SyncEvent::Mt),
+                Event::Sync(rkvm_input::sync::SyncEvent::All),
+            ],
+        }
+        .encode(&mut data)
+        .await
+        .unwrap();
+        Update::Ping.encode(&mut data).await.unwrap();
+
+        let mut stream = data.as_slice();
+        let mut buffer = Vec::new();
+        Update::decode_with_buffer(&mut stream, &mut buffer)
+            .await
+            .unwrap();
+        let capacity = buffer.capacity();
+        assert!(capacity > 0);
+
+        Update::decode_with_buffer(&mut stream, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(buffer.capacity(), capacity);
+    }
 }

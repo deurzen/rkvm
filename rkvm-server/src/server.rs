@@ -485,6 +485,7 @@ async fn client(
     tracing::info!("Authenticated successfully");
 
     let mut interval = time::interval(rkvm_net::PING_INTERVAL);
+    let mut decode_buffer = Vec::new();
 
     loop {
         let recv = async {
@@ -523,7 +524,11 @@ async fn client(
             tracing::debug!(duration = ?duration, "Sent ping");
 
             let start = Instant::now();
-            rkvm_net::timeout(rkvm_net::READ_TIMEOUT, Pong::decode(&mut stream)).await?;
+            rkvm_net::timeout(
+                rkvm_net::READ_TIMEOUT,
+                Pong::decode_with_buffer(&mut stream, &mut decode_buffer),
+            )
+            .await?;
             let duration = start.elapsed();
 
             tracing::debug!(duration = ?duration, "Received pong");

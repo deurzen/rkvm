@@ -68,7 +68,7 @@ Notes:
 
 ## P4 — Reduce per-message allocation in network decode path
 
-Status: todo
+Status: done
 
 Reduce allocator churn in `rkvm-net::message::Message::decode`.
 

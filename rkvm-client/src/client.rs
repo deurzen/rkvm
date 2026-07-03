@@ -144,6 +144,7 @@ async fn run_once(
     let mut start = Instant::now();
 
     let mut interval = time::interval(rkvm_net::PING_INTERVAL + rkvm_net::READ_TIMEOUT);
+    let mut decode_buffer = Vec::new();
     let mut writers = HashMap::new();
 
     // Interval ticks immediately after creation.
@@ -151,7 +152,7 @@ async fn run_once(
 
     loop {
         let update = tokio::select! {
-            update = Update::decode(&mut stream) => update.map_err(Error::Network)?,
+            update = Update::decode_with_buffer(&mut stream, &mut decode_buffer) => update.map_err(Error::Network)?,
             _ = interval.tick() => return Err(Error::Network(io::Error::new(io::ErrorKind::TimedOut, "Ping timed out"))),
         };
 
