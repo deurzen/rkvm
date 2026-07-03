@@ -83,7 +83,6 @@ pub struct Interceptor {
 }
 
 impl Interceptor {
-    #[tracing::instrument(fields(path = ?self.writer.path()), skip(self))]
     pub async fn read(&mut self) -> Result<Event, Error> {
         if let Some((r#type, code, value)) = self.writing {
             tracing::trace!("Resuming interrupted write");

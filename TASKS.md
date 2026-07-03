@@ -2,15 +2,6 @@
 
 Priority order is based on expected impact on input latency/perceived speed first, then robustness, then implementation risk. Tasks are removed before the commit that completes them.
 
-## P3 — Remove hot-path tracing overhead from input reads
-
-Avoid per-event span construction and dynamic path lookup in `Interceptor::read`.
-
-Acceptance:
-- Remove or reduce per-event `tracing::instrument` overhead.
-- Keep useful registration/error logging intact.
-- Preserve input read behavior exactly.
-
 ## P4 — Drain ready evdev events by frame
 
 Reduce per-event async readiness overhead on input capture.
