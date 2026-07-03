@@ -81,68 +81,87 @@ fn input_error(ret: i32) -> Error {
     }
 }
 
+fn recovery_error(err: Error) -> Error {
+    Error::new(
+        ErrorKind::BrokenPipe,
+        format!("Input recovery failed: {err}"),
+    )
+}
+
+pub enum Frame {
+    Events(Vec<Event>),
+    InputLost,
+}
+
+enum Read {
+    Event(Event),
+    InputLost,
+}
+
+enum RawRead {
+    Event(u16, u16, i32),
+    InputLost,
+}
+
+enum NextEvent {
+    Success(u16, u16, i32),
+    Sync,
+}
+
 pub struct Interceptor {
     evdev: Evdev,
-    writer: Writer,
+    registry: Registry,
+    writer: Option<Writer>,
     // The state of `read` is stored here to make it cancel safe.
     events: VecDeque<Event>,
     writing: Option<(u16, u16, i32)>,
-    dropped: bool,
 
     _reader_handle: Handle,
-    _writer_handle: Handle,
+    writer_handle: Option<Handle>,
 }
 
 impl Interceptor {
-    pub async fn read(&mut self) -> Result<Event, Error> {
+    async fn read(&mut self) -> Result<Read, Error> {
         if let Some((r#type, code, value)) = self.writing {
             tracing::trace!("Resuming interrupted write");
 
-            self.writer.write_raw(r#type, code, value).await?;
+            self.writer_mut()?.write_raw(r#type, code, value).await?;
             self.writing = None;
         }
 
         while !matches!(self.events.back(), Some(Event::Sync(SyncEvent::All))) {
-            let (r#type, code, value) = self.read_raw().await?;
+            let (r#type, code, value) = match self.read_raw().await? {
+                RawRead::Event(r#type, code, value) => (r#type, code, value),
+                RawRead::InputLost => {
+                    self.recover_input_loss().await?;
+                    return Ok(Read::InputLost);
+                }
+            };
+
             let event = match r#type as _ {
-                glue::EV_REL if !self.dropped => {
+                glue::EV_REL => {
                     RelAxis::from_raw(code).map(|axis| Event::Rel(RelEvent { axis, value }))
                 }
-                glue::EV_ABS if !self.dropped => match code as _ {
+                glue::EV_ABS => match code as _ {
                     glue::ABS_MT_TOOL_TYPE => {
                         ToolType::from_raw(value).map(|value| AbsEvent::MtToolType { value })
                     }
                     _ => AbsAxis::from_raw(code).map(|axis| AbsEvent::Axis { axis, value }),
                 }
                 .map(Event::Abs),
-                glue::EV_KEY if !self.dropped && (value == 0 || value == 1) => Key::from_raw(code)
-                    .map(|key| {
-                        Event::Key(KeyEvent {
-                            key,
-                            down: value == 1,
-                        })
-                    }),
+                glue::EV_KEY if value == 0 || value == 1 => Key::from_raw(code).map(|key| {
+                    Event::Key(KeyEvent {
+                        key,
+                        down: value == 1,
+                    })
+                }),
                 glue::EV_SYN => match code as _ {
-                    glue::SYN_REPORT => {
-                        if self.dropped {
-                            self.dropped = false;
-                            continue;
-                        }
-
-                        Some(Event::Sync(SyncEvent::All))
-                    }
+                    glue::SYN_REPORT => Some(Event::Sync(SyncEvent::All)),
                     glue::SYN_DROPPED => {
-                        tracing::warn!(
-                            "Dropped {} event{}",
-                            self.events.len(),
-                            if self.events.len() == 1 { "" } else { "s" }
-                        );
-
-                        self.events.clear();
-                        self.dropped = true;
-                        continue;
+                        self.recover_input_loss().await?;
+                        return Ok(Read::InputLost);
                     }
-                    glue::SYN_MT_REPORT if !self.dropped => Some(Event::Sync(SyncEvent::Mt)),
+                    glue::SYN_MT_REPORT => Some(Event::Sync(SyncEvent::Mt)),
                     _ => continue,
                 },
                 _ => None,
@@ -154,29 +173,32 @@ impl Interceptor {
             }
 
             self.writing = Some((r#type, code, value));
-            self.writer.write_raw(r#type, code, value).await?;
+            self.writer_mut()?.write_raw(r#type, code, value).await?;
             self.writing = None;
         }
 
-        Ok(self.events.pop_front().unwrap())
+        Ok(Read::Event(self.events.pop_front().unwrap()))
     }
 
-    pub async fn read_frame(&mut self) -> Result<Vec<Event>, Error> {
+    pub async fn read_frame(&mut self) -> Result<Frame, Error> {
         let mut events = Vec::new();
 
         loop {
-            let event = self.read().await?;
+            let event = match self.read().await? {
+                Read::Event(event) => event,
+                Read::InputLost => return Ok(Frame::InputLost),
+            };
             let is_frame_end = matches!(&event, Event::Sync(SyncEvent::All));
             events.push(event);
 
             if is_frame_end {
-                return Ok(events);
+                return Ok(Frame::Events(events));
             }
         }
     }
 
     pub async fn write(&mut self, event: &Event) -> Result<(), Error> {
-        self.writer.write(event).await
+        self.writer_mut()?.write(event).await
     }
 
     pub fn name(&self) -> &CStr {
@@ -214,7 +236,55 @@ impl Interceptor {
         Repeat::new(self)
     }
 
-    async fn read_raw(&mut self) -> Result<(u16, u16, i32), Error> {
+    fn writer_mut(&mut self) -> Result<&mut Writer, Error> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "Local writer unavailable"))
+    }
+
+    async fn recover_input_loss(&mut self) -> Result<(), Error> {
+        tracing::warn!(
+            "Dropped {} event{}; resetting input state",
+            self.events.len(),
+            if self.events.len() == 1 { "" } else { "s" }
+        );
+
+        self.events.clear();
+        self.writing = None;
+        self.drain_sync_events().map_err(recovery_error)?;
+        self.reset_writer().await.map_err(recovery_error)
+    }
+
+    fn drain_sync_events(&self) -> Result<(), Error> {
+        loop {
+            match self.try_read_event(glue::libevdev_read_flag_LIBEVDEV_READ_FLAG_SYNC) {
+                Ok(NextEvent::Success(..) | NextEvent::Sync) => {}
+                Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn reset_writer(&mut self) -> Result<(), Error> {
+        self.writer.take();
+        self.writer_handle.take();
+
+        let writer = Writer::from_evdev(&self.evdev).await?;
+        let path = writer
+            .path()
+            .ok_or_else(|| Error::new(ErrorKind::Other, "No syspath for writer"))?;
+        let metadata = fs::metadata(path)?;
+        let writer_handle = self
+            .registry
+            .register(Entry::from_metadata(&metadata))
+            .ok_or_else(|| Error::new(ErrorKind::Other, "Writer already registered"))?;
+
+        self.writer = Some(writer);
+        self.writer_handle = Some(writer_handle);
+        Ok(())
+    }
+
+    async fn read_raw(&mut self) -> Result<RawRead, Error> {
         let file = self.evdev.file().unwrap();
 
         loop {
@@ -244,22 +314,33 @@ impl Interceptor {
         Ok(ret != 0)
     }
 
-    fn try_read_raw(&self) -> Result<(u16, u16, i32), Error> {
+    fn try_read_raw(&self) -> Result<RawRead, Error> {
+        match self.try_read_event(glue::libevdev_read_flag_LIBEVDEV_READ_FLAG_NORMAL)? {
+            NextEvent::Success(r#type, code, value) => Ok(RawRead::Event(r#type, code, value)),
+            NextEvent::Sync => Ok(RawRead::InputLost),
+        }
+    }
+
+    fn try_read_event(&self, flags: u32) -> Result<NextEvent, Error> {
         let mut event = MaybeUninit::uninit();
-        let ret = unsafe {
-            glue::libevdev_next_event(
-                self.evdev.as_ptr(),
-                glue::libevdev_read_flag_LIBEVDEV_READ_FLAG_NORMAL,
-                event.as_mut_ptr(),
-            )
-        };
+        let ret =
+            unsafe { glue::libevdev_next_event(self.evdev.as_ptr(), flags, event.as_mut_ptr()) };
 
         if ret < 0 {
             return Err(input_error(ret));
         }
 
         let event = unsafe { event.assume_init() };
-        Ok((event.type_, event.code, event.value))
+        match ret as _ {
+            glue::libevdev_read_status_LIBEVDEV_READ_STATUS_SUCCESS => {
+                Ok(NextEvent::Success(event.type_, event.code, event.value))
+            }
+            glue::libevdev_read_status_LIBEVDEV_READ_STATUS_SYNC => Ok(NextEvent::Sync),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid libevdev read status",
+            )),
+        }
     }
 
     #[tracing::instrument(skip(registry, device_filter))]
@@ -365,13 +446,13 @@ impl Interceptor {
 
         Ok(Self {
             evdev,
-            writer,
+            registry: registry.clone(),
+            writer: Some(writer),
             events: VecDeque::new(),
-            dropped: false,
             writing: None,
 
             _reader_handle: reader_handle,
-            _writer_handle: writer_handle,
+            writer_handle: Some(writer_handle),
         })
     }
 }

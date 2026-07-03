@@ -1,6 +1,7 @@
 use crate::config::DeviceMatch;
 use rkvm_input::abs::{AbsAxis, AbsInfo};
 use rkvm_input::event::Event;
+use rkvm_input::interceptor::Frame;
 use rkvm_input::key::{Key, KeyEvent};
 use rkvm_input::monitor::Monitor;
 use rkvm_input::rel::RelAxis;
@@ -124,18 +125,7 @@ pub async fn run(
 
                 let init_updates = devices
                     .iter()
-                    .map(|(id, device)| Update::CreateDevice {
-                        id,
-                        name: device.name.clone(),
-                        version: device.version,
-                        vendor: device.vendor,
-                        product: device.product,
-                        rel: device.rel.clone(),
-                        abs: device.abs.clone(),
-                        keys: device.keys.clone(),
-                        delay: device.delay,
-                        period: device.period,
-                    })
+                    .map(|(id, device)| create_device_update(id, device))
                     .collect::<Vec<_>>();
 
                 for update in init_updates {
@@ -242,7 +232,7 @@ pub async fn run(
                 );
             }
             (id, result) = event => match result {
-                Ok(events) => {
+                Ok(Frame::Events(events)) => {
                     let mut routed = Vec::new();
 
                     for event in events {
@@ -346,6 +336,22 @@ pub async fn run(
                         );
                     }
                 }
+                Ok(Frame::InputLost) => {
+                    tracing::warn!(id = %id, "Input device lost synchronization; resetting routed state");
+                    reset_routing_state(&mut current, &mut previous, &mut active_binding, &mut pressed_keys);
+
+                    let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
+                    for key in client_keys {
+                        reset_client_device(
+                            &mut clients,
+                            key,
+                            id,
+                            &devices[id],
+                            &mut current,
+                            &mut previous,
+                        );
+                    }
+                }
                 Err(err) if err.kind() == ErrorKind::BrokenPipe => {
                     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
                     for key in client_keys {
@@ -395,6 +401,56 @@ fn next_route(clients: &Slab<(Sender<Update>, SocketAddr)>, current: usize) -> u
         .map(|(key, _)| key + 1)
         .find(|idx| *idx > current)
         .unwrap_or(0)
+}
+
+fn create_device_update(id: usize, device: &Device) -> Update {
+    Update::CreateDevice {
+        id,
+        name: device.name.clone(),
+        version: device.version,
+        vendor: device.vendor,
+        product: device.product,
+        rel: device.rel.clone(),
+        abs: device.abs.clone(),
+        keys: device.keys.clone(),
+        delay: device.delay,
+        period: device.period,
+    }
+}
+
+fn reset_routing_state(
+    current: &mut usize,
+    previous: &mut usize,
+    active_binding: &mut Option<HashSet<Key>>,
+    pressed_keys: &mut HashSet<Key>,
+) {
+    *current = 0;
+    *previous = 0;
+    *active_binding = None;
+    pressed_keys.clear();
+}
+
+fn reset_client_device(
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+    key: usize,
+    id: usize,
+    device: &Device,
+    current: &mut usize,
+    previous: &mut usize,
+) -> bool {
+    try_send_update(
+        clients,
+        key,
+        Update::DestroyDevice { id },
+        current,
+        previous,
+    ) && try_send_update(
+        clients,
+        key,
+        create_device_update(id, device),
+        current,
+        previous,
+    )
 }
 
 fn switch_key_set(bindings: &[HashSet<Key>]) -> HashSet<Key> {
@@ -682,6 +738,74 @@ mod tests {
         assert_eq!(current, 0);
         assert_eq!(previous, 0);
         assert!(!route_exists(&clients, key + 1));
+    }
+
+    fn test_device() -> Device {
+        Device {
+            name: CString::new("test").unwrap(),
+            vendor: 1,
+            product: 2,
+            version: 3,
+            rel: HashSet::new(),
+            abs: HashMap::new(),
+            keys: HashSet::new(),
+            delay: None,
+            period: None,
+            sender: mpsc::channel(1).0,
+        }
+    }
+
+    #[test]
+    fn reset_routing_state_routes_local_and_clears_switch_state() {
+        let mut current = 2;
+        let mut previous = 1;
+        let mut active_binding = Some(
+            [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
+                .into_iter()
+                .collect(),
+        );
+        let mut pressed_keys = [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
+            .into_iter()
+            .collect();
+
+        reset_routing_state(
+            &mut current,
+            &mut previous,
+            &mut active_binding,
+            &mut pressed_keys,
+        );
+
+        assert_eq!(current, 0);
+        assert_eq!(previous, 0);
+        assert!(active_binding.is_none());
+        assert!(pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn reset_client_device_disconnects_on_partial_barrier_enqueue() {
+        let mut clients = Slab::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let key = clients.insert((sender, "127.0.0.1:1234".parse().unwrap()));
+        let mut current = key + 1;
+        let mut previous = key + 1;
+        let device = test_device();
+
+        assert!(!reset_client_device(
+            &mut clients,
+            key,
+            7,
+            &device,
+            &mut current,
+            &mut previous,
+        ));
+        assert!(!clients.contains(key));
+        assert_eq!(current, 0);
+        assert_eq!(previous, 0);
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Update::DestroyDevice { id: 7 }
+        ));
     }
 
     #[test]

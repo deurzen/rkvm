@@ -251,7 +251,8 @@ async fn run_once(
                 start = Instant::now();
 
                 rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
-                    Pong.encode_with_buffer(&mut stream, &mut encode_buffer).await?;
+                    Pong.encode_with_buffer(&mut stream, &mut encode_buffer)
+                        .await?;
                     stream.flush().await?;
 
                     Ok(())
