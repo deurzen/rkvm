@@ -581,25 +581,6 @@ async fn client(mut receiver: Receiver<Update>, stream: ClientStream) -> Result<
             tokio::select! {
                 biased;
 
-                recv = receiver.recv() => {
-                    let update = match recv {
-                        Some(update) => update,
-                        None => break,
-                    };
-
-                    let start = Instant::now();
-                    rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
-                        update.encode_with_buffer(&mut write, &mut encode_buffer).await?;
-                        write.flush().await?;
-
-                        Ok(())
-                    })
-                    .await?;
-                    let duration = start.elapsed();
-
-                    interval.reset();
-                    tracing::trace!(duration = ?duration, "Wrote an update");
-                }
                 result = pong_receiver.recv(), if waiting_for_pong => {
                     match result {
                         Some(Ok(())) => {
@@ -618,6 +599,25 @@ async fn client(mut receiver: Receiver<Update>, stream: ClientStream) -> Result<
                         ErrorKind::TimedOut,
                         "Pong timed out",
                     )));
+                }
+                recv = receiver.recv() => {
+                    let update = match recv {
+                        Some(update) => update,
+                        None => break,
+                    };
+
+                    let start = Instant::now();
+                    rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
+                        update.encode_with_buffer(&mut write, &mut encode_buffer).await?;
+                        write.flush().await?;
+
+                        Ok(())
+                    })
+                    .await?;
+                    let duration = start.elapsed();
+
+                    interval.reset();
+                    tracing::trace!(duration = ?duration, "Wrote an update");
                 }
                 _ = interval.tick(), if !waiting_for_pong => {
                     let start = Instant::now();
