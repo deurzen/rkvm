@@ -14,7 +14,9 @@ switch-keys = ["left-alt", "left-ctrl"]
 # grabs every applicable /dev/input/event* device. If set, only matching devices
 # are grabbed and forwarded. Match fields in one table are ANDed; tables are ORed.
 # Prefer stable /dev/input/by-id/*-event-kbd or /dev/input/by-path/*-event-kbd
-# symlinks over /dev/input/eventN paths.
+# symlinks over /dev/input/eventN paths. Vendor/product-only rules can match
+# multiple event nodes from one physical device or USB receiver. Run
+# `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidates.
 # device-whitelist = [
 #     { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
 #     { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },

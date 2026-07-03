@@ -13,6 +13,21 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 const EVENT_PATHS: &[&str] = &["/dev/input", "/dev/input/by-id", "/dev/input/by-path"];
 
+pub struct CandidateDevice {
+    info: DeviceInfo,
+    aliases: Vec<PathBuf>,
+}
+
+impl CandidateDevice {
+    pub fn info(&self) -> &DeviceInfo {
+        &self.info
+    }
+
+    pub fn aliases(&self) -> &[PathBuf] {
+        &self.aliases
+    }
+}
+
 pub struct Monitor {
     receiver: Receiver<Result<Interceptor, Error>>,
 }
@@ -38,6 +53,54 @@ impl Monitor {
             .await
             .ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "Monitor task exited"))?
     }
+}
+
+pub async fn list_devices() -> Result<Vec<CandidateDevice>, Error> {
+    let mut devices = Vec::new();
+    let mut by_canonical_path = HashMap::new();
+
+    let mut read_dir = fs::read_dir("/dev/input").await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        if !is_event_path(&path).await {
+            continue;
+        }
+
+        let canonical_path = fs::canonicalize(&path).await?;
+        let info = DeviceInfo::open(&path).await?;
+        by_canonical_path.insert(canonical_path, devices.len());
+        devices.push(CandidateDevice {
+            info,
+            aliases: Vec::new(),
+        });
+    }
+
+    for event_path in ["/dev/input/by-id", "/dev/input/by-path"] {
+        let mut read_dir = match fs::read_dir(event_path).await {
+            Ok(read_dir) => read_dir,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path();
+            if !is_event_path(&path).await {
+                continue;
+            }
+
+            let canonical_path = fs::canonicalize(&path).await?;
+            if let Some(index) = by_canonical_path.get(&canonical_path) {
+                devices[*index].aliases.push(path);
+            }
+        }
+    }
+
+    devices.sort_by(|a, b| a.info.path().cmp(b.info.path()));
+    for device in &mut devices {
+        device.aliases.sort();
+    }
+
+    Ok(devices)
 }
 
 async fn is_event_path(path: &Path) -> bool {

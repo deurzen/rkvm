@@ -82,7 +82,7 @@ Notes:
 
 ## P5 — Whitelist usability/robustness follow-up
 
-Status: todo
+Status: done
 
 Make the device whitelist easier and safer to use for keyboard-only forwarding.
 

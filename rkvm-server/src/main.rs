@@ -3,7 +3,8 @@ mod server;
 mod tls;
 
 use clap::Parser;
-use config::Config;
+use config::{Config, DeviceMatch};
+use rkvm_input::monitor::list_devices;
 use std::future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +22,8 @@ struct Args {
     config_path: PathBuf,
     #[structopt(help = "Shutdown after N seconds", long, short)]
     shutdown_after: Option<u64>,
+    #[structopt(help = "List input devices and exit", long)]
+    list_devices: bool,
 }
 
 #[tokio::main]
@@ -70,6 +73,18 @@ async fn main() -> ExitCode {
         tracing::error!("Error parsing config: client-queue-size must be greater than zero");
         return ExitCode::FAILURE;
     }
+    warn_on_broad_device_whitelist(&config.device_whitelist);
+
+    if args.list_devices {
+        match print_devices(config.device_whitelist.as_deref()).await {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(err) => {
+                tracing::error!("Error listing input devices: {}", err);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let client_queue_timeout = Duration::from_millis(
         config
             .client_queue_timeout_ms
@@ -126,4 +141,48 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn warn_on_broad_device_whitelist(device_whitelist: &Option<Vec<DeviceMatch>>) {
+    let Some(device_whitelist) = device_whitelist else {
+        return;
+    };
+
+    if device_whitelist.iter().any(|item| item.path.is_none()) {
+        tracing::warn!(
+            "device-whitelist entries without path may match multiple event nodes; prefer /dev/input/by-id/*-event-kbd or /dev/input/by-path/*-event-kbd for keyboard-only forwarding"
+        );
+    }
+}
+
+async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), std::io::Error> {
+    for device in list_devices().await? {
+        let info = device.info();
+        let whitelist = match device_whitelist {
+            Some(items) if items.iter().any(|item| item.matches(info)) => "yes",
+            Some(_) => "no",
+            None => "disabled",
+        };
+
+        println!("path = {}", info.path().display());
+        println!("name = {:?}", info.name());
+        println!("vendor = 0x{:04x}", info.vendor());
+        println!("product = 0x{:04x}", info.product());
+        println!("version = 0x{:04x}", info.version());
+        println!("whitelisted = {}", whitelist);
+
+        if device.aliases().is_empty() {
+            println!("aliases = []");
+        } else {
+            println!("aliases = [");
+            for alias in device.aliases() {
+                println!("    {},", alias.display());
+            }
+            println!("]");
+        }
+
+        println!();
+    }
+
+    Ok(())
 }

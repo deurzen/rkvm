@@ -48,7 +48,9 @@ After installation:
   per-client queue settings (`client-queue-size`, `client-queue-timeout-ms`),
   and `device-whitelist` if you only want rkvm to grab and forward selected input devices. Prefer stable
   `/dev/input/by-id/*-event-kbd` or `/dev/input/by-path/*-event-kbd` symlinks in the whitelist instead of
-  `/dev/input/eventN` paths, because event numbers can change between boots.
+  `/dev/input/eventN` paths, because event numbers can change between boots. Use
+  `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidate devices and whitelist matches; avoid
+  vendor/product-only rules unless you want every matching event node from that physical device or receiver.
 - Since rkvm-server grabs all input, i's a good idea to do a test run first to make sure you won't end up
   being unable to user your keyboard and/or mouse because your display server is not properly configured to receive input from rkvm.
 

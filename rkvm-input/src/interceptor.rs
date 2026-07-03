@@ -14,22 +14,41 @@ use crate::sync::SyncEvent;
 use crate::writer::Writer;
 
 use std::collections::VecDeque;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+#[derive(Clone)]
 pub struct DeviceInfo {
     path: PathBuf,
-    name: std::ffi::CString,
+    name: CString,
     vendor: u16,
     product: u16,
     version: u16,
 }
 
 impl DeviceInfo {
+    pub async fn open(path: &Path) -> Result<Self, Error> {
+        let evdev = Evdev::open(path).await?;
+        Ok(Self::from_evdev(path, &evdev))
+    }
+
+    fn from_evdev(path: &Path, evdev: &Evdev) -> Self {
+        let name = unsafe { glue::libevdev_get_name(evdev.as_ptr()) };
+        let name = unsafe { CStr::from_ptr(name) }.to_owned();
+
+        Self {
+            path: path.to_owned(),
+            name,
+            vendor: unsafe { glue::libevdev_get_id_vendor(evdev.as_ptr()) as _ },
+            product: unsafe { glue::libevdev_get_id_product(evdev.as_ptr()) as _ },
+            version: unsafe { glue::libevdev_get_id_version(evdev.as_ptr()) as _ },
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -234,15 +253,7 @@ impl Interceptor {
         F: Fn(&DeviceInfo) -> bool + ?Sized,
     {
         let evdev = Evdev::open(path).await?;
-        let name = unsafe { glue::libevdev_get_name(evdev.as_ptr()) };
-        let name = unsafe { CStr::from_ptr(name) }.to_owned();
-        let info = DeviceInfo {
-            path: path.to_owned(),
-            name,
-            vendor: unsafe { glue::libevdev_get_id_vendor(evdev.as_ptr()) as _ },
-            product: unsafe { glue::libevdev_get_id_product(evdev.as_ptr()) as _ },
-            version: unsafe { glue::libevdev_get_id_version(evdev.as_ptr()) as _ },
-        };
+        let info = DeviceInfo::from_evdev(path, &evdev);
 
         if !device_filter(&info) {
             tracing::info!(
