@@ -37,7 +37,7 @@ Notes:
 
 ## P2 — Slow-client isolation / bounded backpressure policy
 
-Status: todo
+Status: done
 
 Prevent one slow or stuck client from blocking server input processing for everyone.
 

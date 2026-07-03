@@ -24,6 +24,8 @@ use tokio::time;
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
 
+const CLIENT_QUEUE_SIZE: usize = 32;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Network error: {0}")]
@@ -72,8 +74,14 @@ pub async fn run(
                 let password = password.to_owned();
 
                 // Remove dead clients.
-                clients.retain(|_, (client, _)| !client.is_closed());
-                if !clients.contains(current) {
+                let closed_clients = clients
+                    .iter()
+                    .filter_map(|(key, (client, _))| client.is_closed().then_some(key))
+                    .collect::<Vec<_>>();
+                for key in closed_clients {
+                    remove_client(&mut clients, key, &mut current, &mut previous, "closed channel");
+                }
+                if !route_exists(&clients, current) {
                     current = 0;
                 }
 
@@ -93,7 +101,7 @@ pub async fn run(
                     })
                     .collect();
 
-                let (sender, receiver) = mpsc::channel(1);
+                let (sender, receiver) = mpsc::channel(CLIENT_QUEUE_SIZE);
                 clients.insert((sender, addr));
 
                 let span = tracing::info_span!("connection", addr = %addr);
@@ -122,13 +130,14 @@ pub async fn run(
                 let keys = interceptor.key().collect::<HashSet<_>>();
                 let repeat = interceptor.repeat();
 
-                for (_, (sender, _)) in &clients {
+                let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
+                for key in client_keys {
                     let update = Update::CreateDevice {
                         id,
                         name: name.clone(),
-                        version: version.clone(),
-                        vendor: vendor.clone(),
-                        product: product.clone(),
+                        version,
+                        vendor,
+                        product,
                         rel: rel.clone(),
                         abs: abs.clone(),
                         keys: keys.clone(),
@@ -136,7 +145,13 @@ pub async fn run(
                         period: repeat.period,
                     };
 
-                    let _ = sender.send(update).await;
+                    try_send_update(
+                        &mut clients,
+                        key,
+                        update,
+                        &mut current,
+                        &mut previous,
+                    );
                 }
 
                 let (interceptor_sender, mut interceptor_receiver) = mpsc::channel(32);
@@ -216,13 +231,7 @@ pub async fn run(
 
                         if press {
                             if pressed_keys.len() == switch_keys.len() {
-                                let exists = |idx| idx == 0 || clients.contains(idx - 1);
-                                loop {
-                                    current = (current + 1) % (clients.len() + 1);
-                                    if exists(current) {
-                                        break;
-                                    }
-                                }
+                                current = next_route(&clients, current);
 
                                 previous = idx;
                                 changed = true;
@@ -276,30 +285,32 @@ pub async fn run(
                             continue;
                         }
 
-                        if !clients.contains(idx - 1) {
+                        if !route_exists(&clients, idx) {
                             if current == idx {
                                 current = 0;
                             }
                             continue;
                         }
 
-                        if clients[idx - 1]
-                            .0
-                            .send(Update::Events { id, events })
-                            .await
-                            .is_err()
-                        {
-                            clients.remove(idx - 1);
-
-                            if current == idx {
-                                current = 0;
-                            }
-                        }
+                        try_send_update(
+                            &mut clients,
+                            idx - 1,
+                            Update::Events { id, events },
+                            &mut current,
+                            &mut previous,
+                        );
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::BrokenPipe => {
-                    for (_, (sender, _)) in &clients {
-                        let _ = sender.send(Update::DestroyDevice { id }).await;
+                    let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
+                    for key in client_keys {
+                        try_send_update(
+                            &mut clients,
+                            key,
+                            Update::DestroyDevice { id },
+                            &mut current,
+                            &mut previous,
+                        );
                     }
                     devices.remove(id);
 
@@ -322,6 +333,65 @@ struct Device {
     delay: Option<i32>,
     period: Option<i32>,
     sender: Sender<Event>,
+}
+
+fn route_exists(clients: &Slab<(Sender<Update>, SocketAddr)>, idx: usize) -> bool {
+    idx == 0 || clients.contains(idx - 1)
+}
+
+fn next_route(clients: &Slab<(Sender<Update>, SocketAddr)>, current: usize) -> usize {
+    clients
+        .iter()
+        .map(|(key, _)| key + 1)
+        .find(|idx| *idx > current)
+        .unwrap_or(0)
+}
+
+fn remove_client(
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+    key: usize,
+    current: &mut usize,
+    previous: &mut usize,
+    reason: &str,
+) {
+    let Some((_, addr)) = clients.try_remove(key) else {
+        return;
+    };
+
+    let idx = key + 1;
+    if *current == idx {
+        *current = 0;
+    }
+    if *previous == idx {
+        *previous = 0;
+    }
+
+    tracing::warn!(idx = %idx, addr = %addr, reason = %reason, "Disconnected client");
+}
+
+fn try_send_update(
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+    key: usize,
+    update: Update,
+    current: &mut usize,
+    previous: &mut usize,
+) -> bool {
+    let result = match clients.get(key) {
+        Some((sender, _)) => sender.try_send(update),
+        None => return false,
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(TrySendError::Closed(_)) => {
+            remove_client(clients, key, current, previous, "closed channel");
+            false
+        }
+        Err(TrySendError::Full(_)) => {
+            remove_client(clients, key, current, previous, "queue overflow");
+            false
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -444,4 +514,39 @@ async fn client(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_entry() -> (Sender<Update>, SocketAddr) {
+        let (sender, _) = mpsc::channel(1);
+        (sender, "127.0.0.1:1234".parse().unwrap())
+    }
+
+    #[test]
+    fn next_route_handles_sparse_client_keys() {
+        let mut clients = Slab::new();
+        let first = clients.insert(client_entry());
+        let second = clients.insert(client_entry());
+        clients.remove(first);
+
+        assert_eq!(next_route(&clients, 0), second + 1);
+        assert_eq!(next_route(&clients, second + 1), 0);
+    }
+
+    #[test]
+    fn remove_client_resets_active_routes() {
+        let mut clients = Slab::new();
+        let key = clients.insert(client_entry());
+        let mut current = key + 1;
+        let mut previous = key + 1;
+
+        remove_client(&mut clients, key, &mut current, &mut previous, "test");
+
+        assert_eq!(current, 0);
+        assert_eq!(previous, 0);
+        assert!(!route_exists(&clients, key + 1));
+    }
 }
