@@ -10,11 +10,11 @@ use rkvm_net::message::Message;
 use rkvm_net::version::Version;
 use rkvm_net::{Pong, Update};
 use slab::Slab;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,7 +25,6 @@ use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
 
 pub(crate) const DEFAULT_CLIENT_QUEUE_SIZE: usize = 256;
-pub(crate) const DEFAULT_CLIENT_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -45,7 +44,6 @@ pub async fn run(
     propagate_switch_keys: bool,
     device_whitelist: Option<Vec<DeviceMatch>>,
     client_queue_size: usize,
-    client_queue_timeout: Duration,
 ) -> Result<(), Error> {
     let listener = TcpListener::bind(&listen).await.map_err(Error::Network)?;
     tracing::info!("Listening on {}", listen);
@@ -64,6 +62,7 @@ pub async fn run(
     let mut pressed_keys = HashSet::new();
 
     let (events_sender, mut events_receiver) = mpsc::channel(1);
+    let (authenticated_sender, mut authenticated_receiver) = mpsc::channel(32);
 
     loop {
         let event = async { events_receiver.recv().await.unwrap() };
@@ -75,18 +74,52 @@ pub async fn run(
 
                 let acceptor = acceptor.clone();
                 let password = password.to_owned();
+                let authenticated_sender = authenticated_sender.clone();
 
-                // Remove dead clients.
-                let closed_clients = clients
-                    .iter()
-                    .filter_map(|(key, (client, _))| client.is_closed().then_some(key))
-                    .collect::<Vec<_>>();
-                for key in closed_clients {
-                    remove_client(&mut clients, key, &mut current, &mut previous, "closed channel");
-                }
-                if !route_exists(&clients, current) {
-                    current = 0;
-                }
+                remove_dead_clients(&mut clients, &mut current, &mut previous);
+
+                let span = tracing::info_span!("connection", addr = %addr);
+                tokio::spawn(
+                    async move {
+                        tracing::info!("Connected");
+
+                        let stream = match authenticate(stream, acceptor, &password).await {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                tracing::error!("Disconnected: {}", err);
+                                return;
+                            }
+                        };
+
+                        let (sender, receiver) = mpsc::channel(client_queue_size);
+                        if authenticated_sender
+                            .send(AuthenticatedClient { sender, addr })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+
+                        match client(receiver, stream).await {
+                            Ok(()) => tracing::info!("Disconnected"),
+                            Err(err) => tracing::error!("Disconnected: {}", err),
+                        }
+                    }
+                    .instrument(span),
+                );
+            }
+            result = authenticated_receiver.recv() => {
+                let Some(authenticated) = result else {
+                    return Err(Error::Network(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "Authenticated client channel closed",
+                    )));
+                };
+
+                remove_dead_clients(&mut clients, &mut current, &mut previous);
+
+                let key = clients.insert((authenticated.sender, authenticated.addr));
+                tracing::info!(idx = %(key + 1), addr = %authenticated.addr, "Client authenticated");
 
                 let init_updates = devices
                     .iter()
@@ -102,23 +135,19 @@ pub async fn run(
                         delay: device.delay,
                         period: device.period,
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
 
-                let (sender, receiver) = mpsc::channel(client_queue_size);
-                clients.insert((sender, addr));
-
-                let span = tracing::info_span!("connection", addr = %addr);
-                tokio::spawn(
-                    async move {
-                        tracing::info!("Connected");
-
-                        match client(init_updates, receiver, stream, acceptor, &password).await {
-                            Ok(()) => tracing::info!("Disconnected"),
-                            Err(err) => tracing::error!("Disconnected: {}", err),
-                        }
+                for update in init_updates {
+                    if !try_send_update(
+                        &mut clients,
+                        key,
+                        update,
+                        &mut current,
+                        &mut previous,
+                    ) {
+                        break;
                     }
-                    .instrument(span),
-                );
+                }
             }
             result = monitor.read() => {
                 let mut interceptor = result.map_err(Error::Input)?;
@@ -148,15 +177,13 @@ pub async fn run(
                         period: repeat.period,
                     };
 
-                    send_update(
+                    try_send_update(
                         &mut clients,
                         key,
                         update,
                         &mut current,
                         &mut previous,
-                        client_queue_timeout,
-                    )
-                    .await;
+                    );
                 }
 
                 let (interceptor_sender, mut interceptor_receiver) = mpsc::channel(32);
@@ -297,29 +324,25 @@ pub async fn run(
                             continue;
                         }
 
-                        send_update(
+                        try_send_update(
                             &mut clients,
                             idx - 1,
                             Update::Events { id, events },
                             &mut current,
                             &mut previous,
-                            client_queue_timeout,
-                        )
-                        .await;
+                        );
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::BrokenPipe => {
                     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
                     for key in client_keys {
-                        send_update(
+                        try_send_update(
                             &mut clients,
                             key,
                             Update::DestroyDevice { id },
                             &mut current,
                             &mut previous,
-                            client_queue_timeout,
-                        )
-                        .await;
+                        );
                     }
                     devices.remove(id);
 
@@ -342,6 +365,11 @@ struct Device {
     delay: Option<i32>,
     period: Option<i32>,
     sender: Sender<Event>,
+}
+
+struct AuthenticatedClient {
+    sender: Sender<Update>,
+    addr: SocketAddr,
 }
 
 fn route_exists(clients: &Slab<(Sender<Update>, SocketAddr)>, idx: usize) -> bool {
@@ -378,36 +406,43 @@ fn remove_client(
     tracing::warn!(idx = %idx, addr = %addr, reason = %reason, "Disconnected client");
 }
 
-async fn send_update(
+fn remove_dead_clients(
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+    current: &mut usize,
+    previous: &mut usize,
+) {
+    let closed_clients = clients
+        .iter()
+        .filter_map(|(key, (client, _))| client.is_closed().then_some(key))
+        .collect::<Vec<_>>();
+    for key in closed_clients {
+        remove_client(clients, key, current, previous, "closed channel");
+    }
+    if !route_exists(clients, *current) {
+        *current = 0;
+    }
+}
+
+fn try_send_update(
     clients: &mut Slab<(Sender<Update>, SocketAddr)>,
     key: usize,
     update: Update,
     current: &mut usize,
     previous: &mut usize,
-    timeout: Duration,
 ) -> bool {
-    let sender = match clients.get(key) {
-        Some((sender, _)) => sender.clone(),
+    let result = match clients.get(key) {
+        Some((sender, _)) => sender.try_send(update),
         None => return false,
     };
 
-    let update = match sender.try_send(update) {
-        Ok(()) => return true,
+    match result {
+        Ok(()) => true,
         Err(TrySendError::Closed(_)) => {
-            remove_client(clients, key, current, previous, "closed channel");
-            return false;
-        }
-        Err(TrySendError::Full(update)) => update,
-    };
-
-    match time::timeout(timeout, sender.send(update)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) => {
             remove_client(clients, key, current, previous, "closed channel");
             false
         }
-        Err(_) => {
-            remove_client(clients, key, current, previous, "queue timeout");
+        Err(TrySendError::Full(_)) => {
+            remove_client(clients, key, current, previous, "queue overflow");
             false
         }
     }
@@ -425,13 +460,13 @@ enum ClientError {
     Rand(#[from] rand::Error),
 }
 
-async fn client(
-    mut init_updates: VecDeque<Update>,
-    mut receiver: Receiver<Update>,
+type ClientStream = BufStream<tokio_rustls::server::TlsStream<TcpStream>>;
+
+async fn authenticate(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password: &str,
-) -> Result<(), ClientError> {
+) -> Result<ClientStream, ClientError> {
     let stream = rkvm_net::timeout(rkvm_net::TLS_TIMEOUT, acceptor.accept(stream)).await?;
     tracing::info!("TLS connected");
 
@@ -484,24 +519,24 @@ async fn client(
 
     tracing::info!("Authenticated successfully");
 
+    Ok(stream)
+}
+
+async fn client(
+    mut receiver: Receiver<Update>,
+    mut stream: ClientStream,
+) -> Result<(), ClientError> {
     let mut interval = time::interval(rkvm_net::PING_INTERVAL);
     let mut decode_buffer = Vec::new();
 
     loop {
-        let recv = async {
-            match init_updates.pop_front() {
-                Some(update) => Some(update),
-                None => receiver.recv().await,
-            }
-        };
-
         let update = tokio::select! {
             // Make sure pings have priority.
             // The client could time out otherwise.
             biased;
 
             _ = interval.tick() => Some(Update::Ping),
-            recv = recv => recv,
+            recv = receiver.recv() => recv,
         };
 
         let update = match update {

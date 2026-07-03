@@ -85,12 +85,6 @@ async fn main() -> ExitCode {
         }
     }
 
-    let client_queue_timeout = Duration::from_millis(
-        config
-            .client_queue_timeout_ms
-            .unwrap_or(server::DEFAULT_CLIENT_QUEUE_TIMEOUT.as_millis() as u64),
-    );
-
     let acceptor = match tls::configure(&config.certificate, &config.key).await {
         Ok(acceptor) => acceptor,
         Err(err) => {
@@ -119,7 +113,6 @@ async fn main() -> ExitCode {
             propagate_switch_keys,
             device_whitelist,
             client_queue_size,
-            client_queue_timeout,
         ) => {
             if let Err(err) = result {
                 tracing::error!("Error: {}", err);
@@ -176,7 +169,7 @@ async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), s
         } else {
             println!("aliases = [");
             for alias in device.aliases() {
-                println!("    {},", alias.display());
+                println!("    {},", toml_string(&alias.display().to_string()));
             }
             println!("]");
         }
@@ -185,4 +178,20 @@ async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), s
     }
 
     Ok(())
+}
+
+fn toml_string(value: &str) -> String {
+    let mut escaped = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }

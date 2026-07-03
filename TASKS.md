@@ -43,7 +43,7 @@ Prevent one slow or stuck client from blocking server input processing for every
 
 Acceptance:
 - Server event loop cannot await indefinitely on a full per-client channel.
-- Slow clients are either dropped after timeout or disconnected on queue overflow.
+- Slow clients are disconnected on queue overflow without blocking the input loop.
 - Policy is logged clearly.
 - Current active-client switching remains correct after disconnect/removal.
 

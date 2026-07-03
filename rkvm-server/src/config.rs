@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
     pub certificate: PathBuf,
@@ -16,7 +16,6 @@ pub struct Config {
     pub propagate_switch_keys: Option<bool>,
     pub device_whitelist: Option<Vec<DeviceMatch>>,
     pub client_queue_size: Option<usize>,
-    pub client_queue_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1307,7 +1306,6 @@ certificate = "/etc/rkvm/certificate.pem"
 key = "/etc/rkvm/key.pem"
 password = "123456789"
 client-queue-size = 128
-client-queue-timeout-ms = 500
 device-whitelist = [
     { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
     { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },
@@ -1318,9 +1316,24 @@ device-whitelist = [
         let device_whitelist = config.device_whitelist.unwrap();
 
         assert_eq!(config.client_queue_size, Some(128));
-        assert_eq!(config.client_queue_timeout_ms, Some(500));
         assert_eq!(device_whitelist.len(), 2);
         assert!(!device_whitelist[0].is_empty());
         assert!(!device_whitelist[1].is_empty());
+    }
+
+    #[test]
+    fn unknown_top_level_field_fails() {
+        let config = r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["right-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+device-white-list = [
+    { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
+]
+"#;
+
+        assert!(toml::from_str::<Config>(config).is_err());
     }
 }

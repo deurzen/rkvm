@@ -103,6 +103,18 @@ pub async fn list_devices() -> Result<Vec<CandidateDevice>, Error> {
     Ok(devices)
 }
 
+fn is_event_alias_directory(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    parent == Path::new("/dev/input")
+        && path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map_or(false, |name| name == "by-id" || name == "by-path")
+}
+
 async fn is_event_path(path: &Path) -> bool {
     let is_event_file = |path: &Path| {
         path.file_name()
@@ -170,6 +182,22 @@ async fn monitor(
                     None => break,
                 },
             };
+
+            if is_event_alias_directory(&path) {
+                if !watches.values().any(|watched| watched == &path) {
+                    let mut read_dir = fs::read_dir(&path).await?;
+                    while let Some(entry) = read_dir.next_entry().await? {
+                        pending.push_back(entry.path());
+                    }
+
+                    let watch = stream
+                        .watches()
+                        .add(&path, WatchMask::CREATE | WatchMask::MOVED_TO)?;
+                    watches.insert(watch, path);
+                }
+
+                continue;
+            }
 
             if !is_event_path(&path).await {
                 tracing::debug!("Skipping non event file {:?}", path);
