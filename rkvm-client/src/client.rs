@@ -145,6 +145,7 @@ async fn run_once(
 
     let mut interval = time::interval(rkvm_net::PING_INTERVAL + rkvm_net::READ_TIMEOUT);
     let mut decode_buffer = Vec::new();
+    let mut encode_buffer = Vec::new();
     let mut writers = HashMap::new();
 
     // Interval ticks immediately after creation.
@@ -250,7 +251,7 @@ async fn run_once(
                 interval.reset();
 
                 rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
-                    Pong.encode(&mut stream).await?;
+                    Pong.encode_with_buffer(&mut stream, &mut encode_buffer).await?;
                     stream.flush().await?;
 
                     Ok(())

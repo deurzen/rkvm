@@ -556,6 +556,7 @@ async fn client(
 ) -> Result<(), ClientError> {
     let mut interval = time::interval(rkvm_net::PING_INTERVAL);
     let mut decode_buffer = Vec::new();
+    let mut encode_buffer = Vec::new();
 
     loop {
         let update = tokio::select! {
@@ -574,7 +575,7 @@ async fn client(
 
         let start = Instant::now();
         rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
-            update.encode(&mut stream).await?;
+            update.encode_with_buffer(&mut stream, &mut encode_buffer).await?;
             stream.flush().await?;
 
             Ok(())

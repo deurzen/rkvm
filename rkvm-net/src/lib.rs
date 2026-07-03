@@ -138,4 +138,53 @@ mod test {
             .unwrap();
         assert_eq!(buffer.capacity(), capacity);
     }
+
+    #[tokio::test]
+    async fn encode_with_buffer_preserves_wire_format() {
+        let update = Update::Events {
+            id: 7,
+            events: vec![
+                Event::Sync(rkvm_input::sync::SyncEvent::Mt),
+                Event::Sync(rkvm_input::sync::SyncEvent::All),
+            ],
+        };
+
+        let mut plain = Vec::new();
+        update.encode(&mut plain).await.unwrap();
+
+        let mut buffered = Vec::new();
+        let mut encode_buffer = Vec::new();
+        update
+            .encode_with_buffer(&mut buffered, &mut encode_buffer)
+            .await
+            .unwrap();
+
+        assert_eq!(buffered, plain);
+    }
+
+    #[tokio::test]
+    async fn encode_with_buffer_reuses_capacity() {
+        let mut output = Vec::new();
+        let mut buffer = Vec::new();
+
+        Update::Events {
+            id: 7,
+            events: vec![
+                Event::Sync(rkvm_input::sync::SyncEvent::Mt),
+                Event::Sync(rkvm_input::sync::SyncEvent::All),
+            ],
+        }
+        .encode_with_buffer(&mut output, &mut buffer)
+        .await
+        .unwrap();
+        let capacity = buffer.capacity();
+        assert!(capacity > 0);
+
+        output.clear();
+        Update::Ping
+            .encode_with_buffer(&mut output, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(buffer.capacity(), capacity);
+    }
 }

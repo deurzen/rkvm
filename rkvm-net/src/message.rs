@@ -16,6 +16,15 @@ pub trait Message: Sized {
     }
 
     async fn encode<W: AsyncWrite + Send + Unpin>(&self, stream: &mut W) -> Result<(), Error>;
+
+    async fn encode_with_buffer<W: AsyncWrite + Send + Unpin>(
+        &self,
+        stream: &mut W,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        let _ = buffer;
+        self.encode(stream).await
+    }
 }
 
 impl<T: DeserializeOwned + Serialize + Sync> Message for T {
@@ -44,19 +53,28 @@ impl<T: DeserializeOwned + Serialize + Sync> Message for T {
     }
 
     async fn encode<W: AsyncWrite + Send + Unpin>(&self, stream: &mut W) -> Result<(), Error> {
-        let data = options()
-            .serialize(self)
+        let mut buffer = Vec::new();
+        self.encode_with_buffer(stream, &mut buffer).await
+    }
+
+    async fn encode_with_buffer<W: AsyncWrite + Send + Unpin>(
+        &self,
+        stream: &mut W,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        buffer.clear();
+        buffer.extend_from_slice(&[0, 0]);
+        options()
+            .serialize_into(&mut *buffer, self)
             .map_err(|err| Error::new(ErrorKind::InvalidInput, err))?;
 
-        let length = data
-            .len()
-            .try_into()
+        let length = u16::try_from(buffer.len() - 2)
             .map_err(|_| Error::new(ErrorKind::InvalidInput, "Data too large"))?;
+        buffer[..2].copy_from_slice(&length.to_be_bytes());
 
-        stream.write_u16(length).await?;
-        stream.write_all(&data).await?;
+        stream.write_all(buffer).await?;
 
-        tracing::trace!("Wrote {} bytes", 2 + data.len());
+        tracing::trace!("Wrote {} bytes", buffer.len());
 
         Ok(())
     }

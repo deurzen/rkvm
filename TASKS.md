@@ -2,16 +2,6 @@
 
 Priority order is based on expected impact on input latency/perceived speed first, then robustness, then implementation risk. Tasks are removed before the commit that completes them.
 
-## P0 — Reuse network encode buffers
-
-Reduce allocator churn in the hot outbound message path.
-
-Acceptance:
-- Add a reusable-buffer encode path mirroring `decode_with_buffer`.
-- Keep the existing length-prefixed wire format unchanged.
-- Use the reusable encode path in latency-sensitive client/server loops.
-- Add tests for wire compatibility and buffer capacity reuse.
-
 ## P1 — Write received input frames to uinput in batches
 
 Avoid per-event async readiness overhead when replaying a received `Update::Events` frame.
