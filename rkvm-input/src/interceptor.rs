@@ -70,6 +70,17 @@ impl DeviceInfo {
     }
 }
 
+fn input_error(ret: i32) -> Error {
+    // ENODEV means that the device got disconnected. However, ErrorKind doesn't
+    // have support for it yet, so translate to BrokenPipe here to not introduce
+    // platform specific code to rkvm-server.
+    if ret == -libc::ENODEV {
+        Error::new(ErrorKind::BrokenPipe, "Device disconnected")
+    } else {
+        Error::from_raw_os_error(-ret)
+    }
+}
+
 pub struct Interceptor {
     evdev: Evdev,
     writer: Writer,
@@ -207,39 +218,48 @@ impl Interceptor {
         let file = self.evdev.file().unwrap();
 
         loop {
-            let result = file.readable().await?.try_io(|_| {
-                let mut event = MaybeUninit::uninit();
-                let ret = unsafe {
-                    glue::libevdev_next_event(
-                        self.evdev.as_ptr(),
-                        glue::libevdev_read_flag_LIBEVDEV_READ_FLAG_NORMAL,
-                        event.as_mut_ptr(),
-                    )
-                };
-
-                if ret < 0 {
-                    // ENODEV means that the device got disconnected.
-                    // However, ErrorKind doesn't have support for it yet,
-                    // so translate to BrokenPipe here to not introduce
-                    // platform specific code to rkvm-server.
-                    let err = if ret == -libc::ENODEV {
-                        Error::new(ErrorKind::BrokenPipe, "Device disconnected")
-                    } else {
-                        Error::from_raw_os_error(-ret)
-                    };
-
-                    return Err(err);
+            if self.has_pending_event()? {
+                match self.try_read_raw() {
+                    Ok(event) => return Ok(event),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err),
                 }
+            }
 
-                let event = unsafe { event.assume_init() };
-                Ok((event.type_, event.code, event.value))
-            });
+            let result = file.readable().await?.try_io(|_| self.try_read_raw());
 
             match result {
                 Ok(result) => return result,
                 Err(_) => continue, // This means it would block.
             }
         }
+    }
+
+    fn has_pending_event(&self) -> Result<bool, Error> {
+        let ret = unsafe { glue::libevdev_has_event_pending(self.evdev.as_ptr()) };
+        if ret < 0 {
+            return Err(input_error(ret));
+        }
+
+        Ok(ret != 0)
+    }
+
+    fn try_read_raw(&self) -> Result<(u16, u16, i32), Error> {
+        let mut event = MaybeUninit::uninit();
+        let ret = unsafe {
+            glue::libevdev_next_event(
+                self.evdev.as_ptr(),
+                glue::libevdev_read_flag_LIBEVDEV_READ_FLAG_NORMAL,
+                event.as_mut_ptr(),
+            )
+        };
+
+        if ret < 0 {
+            return Err(input_error(ret));
+        }
+
+        let event = unsafe { event.assume_init() };
+        Ok((event.type_, event.code, event.value))
     }
 
     #[tracing::instrument(skip(registry, device_filter))]
