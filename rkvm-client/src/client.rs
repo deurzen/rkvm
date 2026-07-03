@@ -184,6 +184,21 @@ pub async fn run(
 
                 tracing::trace!(id = %id, "Wrote an event to device");
             }
+            Update::Events { id, events } => {
+                let writer = writers.get_mut(&id).ok_or_else(|| {
+                    Error::Network(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Server sent events to a nonexistent device",
+                    ))
+                })?;
+
+                let count = events.len();
+                for event in events {
+                    writer.write(&event).await.map_err(Error::Input)?;
+                }
+
+                tracing::trace!(id = %id, count = %count, "Wrote events to device");
+            }
             Update::Ping => {
                 let duration = start.elapsed();
                 tracing::debug!(duration = ?duration, "Received ping");

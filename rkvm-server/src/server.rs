@@ -155,8 +155,8 @@ pub async fn run(
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            event = interceptor.read() => {
-                                if event.is_err() | events_sender.send((id, event)).await.is_err() {
+                            events = interceptor.read_frame() => {
+                                if events.is_err() | events_sender.send((id, events)).await.is_err() {
                                     break;
                                 }
                             }
@@ -192,76 +192,101 @@ pub async fn run(
                 );
             }
             (id, result) = event => match result {
-                Ok(event) => {
-                    let mut press = false;
+                Ok(events) => {
+                    let mut routed = Vec::new();
 
-                    if let Event::Key(KeyEvent { key, down }) = event {
-                        if switch_keys.contains(&key) {
-                            press = true;
+                    for event in events {
+                        let mut press = false;
 
-                            match down {
-                                true => pressed_keys.insert(key),
-                                false => pressed_keys.remove(&key),
-                            };
+                        if let Event::Key(KeyEvent { key, down }) = event {
+                            if switch_keys.contains(&key) {
+                                press = true;
+
+                                match down {
+                                    true => pressed_keys.insert(key),
+                                    false => pressed_keys.remove(&key),
+                                };
+                            }
+                        }
+
+                        // Who to send this event to.
+                        let mut idx = current;
+
+                        if press {
+                            if pressed_keys.len() == switch_keys.len() {
+                                let exists = |idx| idx == 0 || clients.contains(idx - 1);
+                                loop {
+                                    current = (current + 1) % (clients.len() + 1);
+                                    if exists(current) {
+                                        break;
+                                    }
+                                }
+
+                                previous = idx;
+                                changed = true;
+
+                                if current != 0 {
+                                    tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
+                                } else {
+                                    tracing::info!(idx = %current, "Switched client");
+                                }
+                            } else if changed {
+                                idx = previous;
+
+                                if pressed_keys.is_empty() {
+                                    changed = false;
+                                }
+                            }
+                        }
+
+                        if press && !propagate_switch_keys {
+                            continue;
+                        }
+
+                        routed.push((idx, event));
+                        if press {
+                            routed.push((idx, Event::Sync(SyncEvent::All)));
                         }
                     }
 
-                    // Who to send this event to.
-                    let mut idx = current;
+                    let mut routed = routed.into_iter().peekable();
+                    while let Some((idx, event)) = routed.next() {
+                        let mut events = vec![event];
 
-                    if press {
-                        if pressed_keys.len() == switch_keys.len() {
-                            let exists = |idx| idx == 0 || clients.contains(idx - 1);
-                            loop {
-                                current = (current + 1) % (clients.len() + 1);
-                                if exists(current) {
-                                    break;
+                        while matches!(routed.peek(), Some((next_idx, _)) if *next_idx == idx) {
+                            let (_, event) = routed.next().unwrap();
+                            events.push(event);
+                        }
+
+                        // Index 0 - special case to keep the modular arithmetic above working.
+                        if idx == 0 {
+                            // We do a try_send() here rather than a "blocking" send in order to prevent deadlocks.
+                            // In this scenario, the interceptor task is sending events to the main task,
+                            // while the main task is simultaneously sending events back to the interceptor.
+                            // This creates a classic deadlock situation where both tasks are waiting for each other.
+                            for event in events {
+                                match devices[id].sender.try_send(event) {
+                                    Ok(()) | Err(TrySendError::Closed(_)) => {},
+                                    Err(TrySendError::Full(_)) => return Err(Error::Overflow),
                                 }
                             }
 
-                            previous = idx;
-                            changed = true;
-
-                            if current != 0 {
-                                tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
-                            } else {
-                                tracing::info!(idx = %current, "Switched client");
-                            }
-                        } else if changed {
-                            idx = previous;
-
-                            if pressed_keys.is_empty() {
-                                changed = false;
-                            }
-                        }
-                    }
-
-                    if press && !propagate_switch_keys {
-                        continue;
-                    }
-
-                    let events = [event]
-                        .into_iter()
-                        .chain(press.then_some(Event::Sync(SyncEvent::All)));
-
-                    // Index 0 - special case to keep the modular arithmetic above working.
-                    if idx == 0 {
-                        // We do a try_send() here rather than a "blocking" send in order to prevent deadlocks.
-                        // In this scenario, the interceptor task is sending events to the main task,
-                        // while the main task is simultaneously sending events back to the interceptor.
-                        // This creates a classic deadlock situation where both tasks are waiting for each other.
-                        for event in events {
-                            match devices[id].sender.try_send(event) {
-                                Ok(()) | Err(TrySendError::Closed(_)) => {},
-                                Err(TrySendError::Full(_)) => return Err(Error::Overflow),
-                            }
+                            continue;
                         }
 
-                        continue;
-                    }
+                        if !clients.contains(idx - 1) {
+                            if current == idx {
+                                current = 0;
+                            }
+                            continue;
+                        }
 
-                    for event in events {
-                        if clients[idx - 1].0.send(Update::Event { id, event }).await.is_err() {
+                        if clients[idx - 1]
+                            .0
+                            .send(Update::Events { id, events })
+                            .await
+                            .is_err()
+                        {
                             clients.remove(idx - 1);
 
                             if current == idx {

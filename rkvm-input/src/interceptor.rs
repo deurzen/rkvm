@@ -132,6 +132,20 @@ impl Interceptor {
         Ok(self.events.pop_front().unwrap())
     }
 
+    pub async fn read_frame(&mut self) -> Result<Vec<Event>, Error> {
+        let mut events = Vec::new();
+
+        loop {
+            let event = self.read().await?;
+            let is_frame_end = matches!(&event, Event::Sync(SyncEvent::All));
+            events.push(event);
+
+            if is_frame_end {
+                return Ok(events);
+            }
+        }
+    }
+
     pub async fn write(&mut self, event: &Event) -> Result<(), Error> {
         self.writer.write(event).await
     }

@@ -49,6 +49,10 @@ pub enum Update {
         id: usize,
         event: Event,
     },
+    Events {
+        id: usize,
+        events: Vec<Event>,
+    },
     Ping,
 }
 
@@ -75,5 +79,34 @@ mod test {
         Pong.encode(&mut data).await.unwrap();
 
         assert!(!data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_round_trip_in_order() {
+        let update = Update::Events {
+            id: 7,
+            events: vec![
+                Event::Sync(rkvm_input::sync::SyncEvent::Mt),
+                Event::Sync(rkvm_input::sync::SyncEvent::All),
+            ],
+        };
+        let mut data = Vec::new();
+        update.encode(&mut data).await.unwrap();
+
+        let decoded = Update::decode(&mut data.as_slice()).await.unwrap();
+        match decoded {
+            Update::Events { id, events } => {
+                assert_eq!(id, 7);
+                assert!(matches!(
+                    events[0],
+                    Event::Sync(rkvm_input::sync::SyncEvent::Mt)
+                ));
+                assert!(matches!(
+                    events[1],
+                    Event::Sync(rkvm_input::sync::SyncEvent::All)
+                ));
+            }
+            _ => panic!("unexpected update"),
+        }
     }
 }
