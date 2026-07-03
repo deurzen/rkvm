@@ -53,7 +53,7 @@ Notes:
 
 ## P3 — Built-in client reconnect/backoff
 
-Status: todo
+Status: done
 
 Let `rkvm-client` reconnect without relying solely on systemd restart.
 

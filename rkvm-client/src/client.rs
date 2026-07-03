@@ -6,13 +6,17 @@ use rkvm_net::{Pong, Update};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::TcpStream;
 use tokio::time;
 use tokio_rustls::rustls::ServerName;
 use tokio_rustls::TlsConnector;
+
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -30,6 +34,42 @@ pub async fn run(
     hostname: &ServerName,
     port: u16,
     connector: TlsConnector,
+    password: &str,
+) -> Result<(), Error> {
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+
+    loop {
+        tracing::info!("Connecting to server");
+        let started = Instant::now();
+
+        match run_once(hostname, port, &connector, password).await {
+            Ok(()) => {
+                tracing::info!("Disconnected from server");
+                backoff = RECONNECT_BACKOFF_MIN;
+            }
+            Err(Error::Network(err)) => {
+                let stable = started.elapsed() >= RECONNECT_BACKOFF_RESET_AFTER;
+                tracing::warn!(error = %err, delay = ?backoff, "Connection failed, retrying");
+                time::sleep(backoff).await;
+
+                backoff = if stable {
+                    RECONNECT_BACKOFF_MIN
+                } else {
+                    (backoff * 2).min(RECONNECT_BACKOFF_MAX)
+                };
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "Not reconnecting after permanent error");
+                return Err(err);
+            }
+        }
+    }
+}
+
+async fn run_once(
+    hostname: &ServerName,
+    port: u16,
+    connector: &TlsConnector,
     password: &str,
 ) -> Result<(), Error> {
     // Intentionally don't impose any timeout for TCP connect.
