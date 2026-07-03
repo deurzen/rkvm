@@ -66,6 +66,8 @@ pub async fn run(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, addr) = result.map_err(Error::Network)?;
+                stream.set_nodelay(true).map_err(Error::Network)?;
+
                 let acceptor = acceptor.clone();
                 let password = password.to_owned();
 

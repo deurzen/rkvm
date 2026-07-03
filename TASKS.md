@@ -21,7 +21,7 @@ Notes:
 
 ## P1 — TCP_NODELAY for latency-sensitive sockets
 
-Status: todo
+Status: done
 
 Disable Nagle on accepted/connected TCP sockets before TLS wrapping.
 

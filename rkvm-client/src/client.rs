@@ -40,6 +40,8 @@ pub async fn run(
     }
     .map_err(Error::Network)?;
 
+    stream.set_nodelay(true).map_err(Error::Network)?;
+
     tracing::info!("Connected to server");
 
     let stream = rkvm_net::timeout(
