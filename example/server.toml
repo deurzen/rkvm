@@ -5,6 +5,11 @@ switch-keys = ["left-alt", "left-ctrl"]
 # Optional, defaults to true.
 # propagate-switch-keys = true
 
+# Per-client server queue settings. These bound how long a slow or stuck client
+# can delay server input processing. Optional, defaults shown here.
+# client-queue-size = 256
+# client-queue-timeout-ms = 250
+
 # Optional input device allowlist. If unset, rkvm keeps the current behavior and
 # grabs every applicable /dev/input/event* device. If set, only matching devices
 # are grabbed and forwarded. Match fields in one table are ANDed; tables are ORed.

@@ -15,6 +15,8 @@ pub struct Config {
     pub switch_keys: HashSet<SwitchKey>,
     pub propagate_switch_keys: Option<bool>,
     pub device_whitelist: Option<Vec<DeviceMatch>>,
+    pub client_queue_size: Option<usize>,
+    pub client_queue_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1304,6 +1306,8 @@ switch-keys = ["right-ctrl"]
 certificate = "/etc/rkvm/certificate.pem"
 key = "/etc/rkvm/key.pem"
 password = "123456789"
+client-queue-size = 128
+client-queue-timeout-ms = 500
 device-whitelist = [
     { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
     { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },
@@ -1313,6 +1317,8 @@ device-whitelist = [
         let config = toml::from_str::<Config>(config).unwrap();
         let device_whitelist = config.device_whitelist.unwrap();
 
+        assert_eq!(config.client_queue_size, Some(128));
+        assert_eq!(config.client_queue_timeout_ms, Some(500));
         assert_eq!(device_whitelist.len(), 2);
         assert!(!device_whitelist[0].is_empty());
         assert!(!device_whitelist[1].is_empty());

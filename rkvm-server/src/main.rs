@@ -63,6 +63,19 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let client_queue_size = config
+        .client_queue_size
+        .unwrap_or(server::DEFAULT_CLIENT_QUEUE_SIZE);
+    if client_queue_size == 0 {
+        tracing::error!("Error parsing config: client-queue-size must be greater than zero");
+        return ExitCode::FAILURE;
+    }
+    let client_queue_timeout = Duration::from_millis(
+        config
+            .client_queue_timeout_ms
+            .unwrap_or(server::DEFAULT_CLIENT_QUEUE_TIMEOUT.as_millis() as u64),
+    );
+
     let acceptor = match tls::configure(&config.certificate, &config.key).await {
         Ok(acceptor) => acceptor,
         Err(err) => {
@@ -83,7 +96,16 @@ async fn main() -> ExitCode {
     let device_whitelist = config.device_whitelist;
 
     tokio::select! {
-        result = server::run(config.listen, acceptor, &config.password, &switch_keys, propagate_switch_keys, device_whitelist) => {
+        result = server::run(
+            config.listen,
+            acceptor,
+            &config.password,
+            &switch_keys,
+            propagate_switch_keys,
+            device_whitelist,
+            client_queue_size,
+            client_queue_timeout,
+        ) => {
             if let Err(err) = result {
                 tracing::error!("Error: {}", err);
                 return ExitCode::FAILURE;

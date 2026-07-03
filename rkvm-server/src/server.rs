@@ -24,8 +24,8 @@ use tokio::time;
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
 
-const CLIENT_QUEUE_SIZE: usize = 256;
-const CLIENT_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const DEFAULT_CLIENT_QUEUE_SIZE: usize = 256;
+pub(crate) const DEFAULT_CLIENT_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -44,6 +44,8 @@ pub async fn run(
     switch_keys: &HashSet<Key>,
     propagate_switch_keys: bool,
     device_whitelist: Option<Vec<DeviceMatch>>,
+    client_queue_size: usize,
+    client_queue_timeout: Duration,
 ) -> Result<(), Error> {
     let listener = TcpListener::bind(&listen).await.map_err(Error::Network)?;
     tracing::info!("Listening on {}", listen);
@@ -102,7 +104,7 @@ pub async fn run(
                     })
                     .collect();
 
-                let (sender, receiver) = mpsc::channel(CLIENT_QUEUE_SIZE);
+                let (sender, receiver) = mpsc::channel(client_queue_size);
                 clients.insert((sender, addr));
 
                 let span = tracing::info_span!("connection", addr = %addr);
@@ -152,6 +154,7 @@ pub async fn run(
                         update,
                         &mut current,
                         &mut previous,
+                        client_queue_timeout,
                     )
                     .await;
                 }
@@ -300,6 +303,7 @@ pub async fn run(
                             Update::Events { id, events },
                             &mut current,
                             &mut previous,
+                            client_queue_timeout,
                         )
                         .await;
                     }
@@ -313,6 +317,7 @@ pub async fn run(
                             Update::DestroyDevice { id },
                             &mut current,
                             &mut previous,
+                            client_queue_timeout,
                         )
                         .await;
                     }
@@ -379,6 +384,7 @@ async fn send_update(
     update: Update,
     current: &mut usize,
     previous: &mut usize,
+    timeout: Duration,
 ) -> bool {
     let sender = match clients.get(key) {
         Some((sender, _)) => sender.clone(),
@@ -394,7 +400,7 @@ async fn send_update(
         Err(TrySendError::Full(update)) => update,
     };
 
-    match time::timeout(CLIENT_QUEUE_TIMEOUT, sender.send(update)).await {
+    match time::timeout(timeout, sender.send(update)).await {
         Ok(Ok(())) => true,
         Ok(Err(_)) => {
             remove_client(clients, key, current, previous, "closed channel");
