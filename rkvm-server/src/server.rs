@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,7 +24,8 @@ use tokio::time;
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
 
-const CLIENT_QUEUE_SIZE: usize = 32;
+const CLIENT_QUEUE_SIZE: usize = 256;
+const CLIENT_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -145,13 +146,14 @@ pub async fn run(
                         period: repeat.period,
                     };
 
-                    try_send_update(
+                    send_update(
                         &mut clients,
                         key,
                         update,
                         &mut current,
                         &mut previous,
-                    );
+                    )
+                    .await;
                 }
 
                 let (interceptor_sender, mut interceptor_receiver) = mpsc::channel(32);
@@ -292,25 +294,27 @@ pub async fn run(
                             continue;
                         }
 
-                        try_send_update(
+                        send_update(
                             &mut clients,
                             idx - 1,
                             Update::Events { id, events },
                             &mut current,
                             &mut previous,
-                        );
+                        )
+                        .await;
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::BrokenPipe => {
                     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
                     for key in client_keys {
-                        try_send_update(
+                        send_update(
                             &mut clients,
                             key,
                             Update::DestroyDevice { id },
                             &mut current,
                             &mut previous,
-                        );
+                        )
+                        .await;
                     }
                     devices.remove(id);
 
@@ -369,26 +373,35 @@ fn remove_client(
     tracing::warn!(idx = %idx, addr = %addr, reason = %reason, "Disconnected client");
 }
 
-fn try_send_update(
+async fn send_update(
     clients: &mut Slab<(Sender<Update>, SocketAddr)>,
     key: usize,
     update: Update,
     current: &mut usize,
     previous: &mut usize,
 ) -> bool {
-    let result = match clients.get(key) {
-        Some((sender, _)) => sender.try_send(update),
+    let sender = match clients.get(key) {
+        Some((sender, _)) => sender.clone(),
         None => return false,
     };
 
-    match result {
-        Ok(()) => true,
+    let update = match sender.try_send(update) {
+        Ok(()) => return true,
         Err(TrySendError::Closed(_)) => {
+            remove_client(clients, key, current, previous, "closed channel");
+            return false;
+        }
+        Err(TrySendError::Full(update)) => update,
+    };
+
+    match time::timeout(CLIENT_QUEUE_TIMEOUT, sender.send(update)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => {
             remove_client(clients, key, current, previous, "closed channel");
             false
         }
-        Err(TrySendError::Full(_)) => {
-            remove_client(clients, key, current, previous, "queue overflow");
+        Err(_) => {
+            remove_client(clients, key, current, previous, "queue timeout");
             false
         }
     }
