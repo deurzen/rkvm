@@ -581,11 +581,14 @@ async fn client(mut receiver: Receiver<Update>, stream: ClientStream) -> Result<
             tokio::select! {
                 biased;
 
-                result = pong_receiver.recv(), if waiting_for_pong => {
+                result = pong_receiver.recv() => {
                     match result {
-                        Some(Ok(())) => {
+                        Some(Ok(())) if waiting_for_pong => {
                             waiting_for_pong = false;
                             tracing::debug!("Received pong");
+                        }
+                        Some(Ok(())) => {
+                            tracing::debug!("Discarding unexpected pong");
                         }
                         Some(Err(err)) => return Err(ClientError::Io(err)),
                         None => return Err(ClientError::Io(io::Error::new(
