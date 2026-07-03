@@ -237,9 +237,7 @@ async fn run_once(
                 })?;
 
                 let count = events.len();
-                for event in events {
-                    writer.write(&event).await.map_err(Error::Input)?;
-                }
+                writer.write_frame(&events).await.map_err(Error::Input)?;
 
                 tracing::trace!(id = %id, count = %count, "Wrote events to device");
             }

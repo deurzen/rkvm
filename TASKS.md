@@ -2,16 +2,6 @@
 
 Priority order is based on expected impact on input latency/perceived speed first, then robustness, then implementation risk. Tasks are removed before the commit that completes them.
 
-## P1 — Write received input frames to uinput in batches
-
-Avoid per-event async readiness overhead when replaying a received `Update::Events` frame.
-
-Acceptance:
-- Add a `Writer` frame/batch write API that preserves event order.
-- Handle partial writes/would-block without duplicating or reordering events.
-- Use the batch API on the client for `Update::Events`.
-- Keep single-event writes available for existing call sites.
-
 ## P2 — Make heartbeat traffic idle-only
 
 Prevent periodic pings from preempting input updates or blocking the per-client writer while waiting for a pong.

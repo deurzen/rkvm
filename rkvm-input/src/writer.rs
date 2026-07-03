@@ -19,28 +19,67 @@ pub struct Writer {
     uinput: Uinput,
 }
 
+fn raw_event(event: &Event) -> Option<(u16, u16, i32)> {
+    let (r#type, code, value) = match event {
+        Event::Rel(RelEvent { axis, value }) => (glue::EV_REL, axis.to_raw(), Some(*value)),
+        Event::Abs(event) => match event {
+            AbsEvent::Axis { axis, value } => (glue::EV_ABS, axis.to_raw(), Some(*value)),
+            AbsEvent::MtToolType { value } => (
+                glue::EV_ABS,
+                Some(glue::ABS_MT_TOOL_TYPE as _),
+                value.to_raw(),
+            ),
+        },
+        Event::Key(KeyEvent { down, key }) => (glue::EV_KEY, key.to_raw(), Some(*down as _)),
+        Event::Sync(event) => (glue::EV_SYN, event.to_raw(), Some(0)),
+    };
+
+    Some((r#type as _, code?, value?))
+}
+
 impl Writer {
     pub fn builder() -> Result<WriterBuilder, Error> {
         WriterBuilder::new()
     }
 
     pub async fn write(&mut self, event: &Event) -> Result<(), Error> {
-        let (r#type, code, value) = match event {
-            Event::Rel(RelEvent { axis, value }) => (glue::EV_REL, axis.to_raw(), Some(*value)),
-            Event::Abs(event) => match event {
-                AbsEvent::Axis { axis, value } => (glue::EV_ABS, axis.to_raw(), Some(*value)),
-                AbsEvent::MtToolType { value } => (
-                    glue::EV_ABS,
-                    Some(glue::ABS_MT_TOOL_TYPE as _),
-                    value.to_raw(),
-                ),
-            },
-            Event::Key(KeyEvent { down, key }) => (glue::EV_KEY, key.to_raw(), Some(*down as _)),
-            Event::Sync(event) => (glue::EV_SYN, event.to_raw(), Some(0)),
-        };
+        if let Some((r#type, code, value)) = raw_event(event) {
+            self.write_raw(r#type, code, value).await?;
+        }
 
-        if let (Some(code), Some(value)) = (code, value) {
-            self.write_raw(r#type as _, code, value).await?;
+        Ok(())
+    }
+
+    pub async fn write_frame(&mut self, events: &[Event]) -> Result<(), Error> {
+        let events = events.iter().filter_map(raw_event).collect::<Vec<_>>();
+        let mut cursor = 0;
+
+        while cursor < events.len() {
+            let result = self.uinput.file().writable().await?.try_io(|_| {
+                while let Some((r#type, code, value)) = events.get(cursor).copied() {
+                    let ret = unsafe {
+                        glue::libevdev_uinput_write_event(
+                            self.uinput.as_ptr(),
+                            r#type as _,
+                            code as _,
+                            value,
+                        )
+                    };
+
+                    if ret < 0 {
+                        return Err(Error::from_raw_os_error(-ret).into());
+                    }
+
+                    cursor += 1;
+                }
+
+                Ok(())
+            });
+
+            match result {
+                Ok(result) => return result,
+                Err(_) => continue, // This means it would block.
+            }
         }
 
         Ok(())
@@ -284,5 +323,34 @@ impl WriterBuilder {
 
     pub async fn build(self) -> Result<Writer, Error> {
         Writer::from_evdev(&self.evdev).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key::Keyboard;
+    use crate::sync::SyncEvent;
+
+    #[test]
+    fn raw_event_preserves_basic_event_order_data() {
+        assert_eq!(
+            raw_event(&Event::Rel(RelEvent {
+                axis: RelAxis::X,
+                value: 12,
+            })),
+            Some((glue::EV_REL as _, glue::REL_X as _, 12))
+        );
+        assert_eq!(
+            raw_event(&Event::Key(KeyEvent {
+                key: Key::Key(Keyboard::A),
+                down: true,
+            })),
+            Some((glue::EV_KEY as _, glue::KEY_A as _, 1))
+        );
+        assert_eq!(
+            raw_event(&Event::Sync(SyncEvent::All)),
+            Some((glue::EV_SYN as _, glue::SYN_REPORT as _, 0))
+        );
     }
 }
