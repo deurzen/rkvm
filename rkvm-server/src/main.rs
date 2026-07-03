@@ -52,6 +52,17 @@ async fn main() -> ExitCode {
         }
     };
 
+    if config
+        .device_whitelist
+        .as_ref()
+        .map_or(false, |items| items.iter().any(|item| item.is_empty()))
+    {
+        tracing::error!(
+            "Error parsing config: device-whitelist entries must contain at least one match field"
+        );
+        return ExitCode::FAILURE;
+    }
+
     let acceptor = match tls::configure(&config.certificate, &config.key).await {
         Ok(acceptor) => acceptor,
         Err(err) => {
@@ -69,9 +80,10 @@ async fn main() -> ExitCode {
 
     let switch_keys = config.switch_keys.into_iter().map(Into::into).collect();
     let propagate_switch_keys = config.propagate_switch_keys.unwrap_or(true);
+    let device_whitelist = config.device_whitelist;
 
     tokio::select! {
-        result = server::run(config.listen, acceptor, &config.password, &switch_keys, propagate_switch_keys) => {
+        result = server::run(config.listen, acceptor, &config.password, &switch_keys, propagate_switch_keys, device_whitelist) => {
             if let Err(err) = result {
                 tracing::error!("Error: {}", err);
                 return ExitCode::FAILURE;

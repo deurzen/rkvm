@@ -18,8 +18,38 @@ use std::ffi::CStr;
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::mem::MaybeUninit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+pub struct DeviceInfo {
+    path: PathBuf,
+    name: std::ffi::CString,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+
+impl DeviceInfo {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn name(&self) -> &CStr {
+        &self.name
+    }
+
+    pub fn vendor(&self) -> u16 {
+        self.vendor
+    }
+
+    pub fn product(&self) -> u16 {
+        self.product
+    }
+
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+}
 
 pub struct Interceptor {
     evdev: Evdev,
@@ -180,9 +210,38 @@ impl Interceptor {
         }
     }
 
-    #[tracing::instrument(skip(registry))]
-    pub(crate) async fn open(path: &Path, registry: &Registry) -> Result<Self, OpenError> {
+    #[tracing::instrument(skip(registry, device_filter))]
+    pub(crate) async fn open<F>(
+        path: &Path,
+        registry: &Registry,
+        device_filter: &F,
+    ) -> Result<Self, OpenError>
+    where
+        F: Fn(&DeviceInfo) -> bool + ?Sized,
+    {
         let evdev = Evdev::open(path).await?;
+        let name = unsafe { glue::libevdev_get_name(evdev.as_ptr()) };
+        let name = unsafe { CStr::from_ptr(name) }.to_owned();
+        let info = DeviceInfo {
+            path: path.to_owned(),
+            name,
+            vendor: unsafe { glue::libevdev_get_id_vendor(evdev.as_ptr()) as _ },
+            product: unsafe { glue::libevdev_get_id_product(evdev.as_ptr()) as _ },
+            version: unsafe { glue::libevdev_get_id_version(evdev.as_ptr()) as _ },
+        };
+
+        if !device_filter(&info) {
+            tracing::info!(
+                path = ?info.path(),
+                name = ?info.name(),
+                vendor = %info.vendor(),
+                product = %info.product(),
+                version = %info.version(),
+                "Ignored device because it is not whitelisted",
+            );
+            return Err(OpenError::NotAppliable);
+        }
+
         let metadata = evdev.file().unwrap().get_ref().metadata()?;
 
         let reader_handle = registry

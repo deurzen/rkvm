@@ -4,6 +4,17 @@ switch-keys = ["left-alt", "left-ctrl"]
 # Whether switch key presses should be propagated on the server and its clients.
 # Optional, defaults to true.
 # propagate-switch-keys = true
+
+# Optional input device allowlist. If unset, rkvm keeps the current behavior and
+# grabs every applicable /dev/input/event* device. If set, only matching devices
+# are grabbed and forwarded. Match fields in one table are ANDed; tables are ORed.
+# Prefer stable /dev/input/by-id/*-event-kbd or /dev/input/by-path/*-event-kbd
+# symlinks over /dev/input/eventN paths.
+# device-whitelist = [
+#     { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
+#     { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },
+# ]
+
 certificate = "/etc/rkvm/certificate.pem"
 key = "/etc/rkvm/key.pem"
 

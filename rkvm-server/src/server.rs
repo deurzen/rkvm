@@ -1,3 +1,4 @@
+use crate::config::DeviceMatch;
 use rkvm_input::abs::{AbsAxis, AbsInfo};
 use rkvm_input::event::Event;
 use rkvm_input::key::{Key, KeyEvent};
@@ -39,11 +40,17 @@ pub async fn run(
     password: &str,
     switch_keys: &HashSet<Key>,
     propagate_switch_keys: bool,
+    device_whitelist: Option<Vec<DeviceMatch>>,
 ) -> Result<(), Error> {
     let listener = TcpListener::bind(&listen).await.map_err(Error::Network)?;
     tracing::info!("Listening on {}", listen);
 
-    let mut monitor = Monitor::new();
+    let mut monitor = match device_whitelist {
+        Some(device_whitelist) => Monitor::with_filter(move |device| {
+            device_whitelist.iter().any(|item| item.matches(device))
+        }),
+        None => Monitor::new(),
+    };
     let mut devices = Slab::<Device>::new();
     let mut clients = Slab::<(Sender<_>, SocketAddr)>::new();
     let mut current = 0;

@@ -1,8 +1,9 @@
+use rkvm_input::interceptor::DeviceInfo;
 use rkvm_input::key::{Button, Key, Keyboard};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -13,6 +14,64 @@ pub struct Config {
     pub password: String,
     pub switch_keys: HashSet<SwitchKey>,
     pub propagate_switch_keys: Option<bool>,
+    pub device_whitelist: Option<Vec<DeviceMatch>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DeviceMatch {
+    pub path: Option<PathBuf>,
+    pub name: Option<String>,
+    pub vendor: Option<u16>,
+    pub product: Option<u16>,
+    pub version: Option<u16>,
+}
+
+impl DeviceMatch {
+    pub fn is_empty(&self) -> bool {
+        self.path.is_none()
+            && self.name.is_none()
+            && self.vendor.is_none()
+            && self.product.is_none()
+            && self.version.is_none()
+    }
+
+    pub fn matches(&self, device: &DeviceInfo) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+
+        self.path
+            .as_ref()
+            .map_or(true, |path| path_matches(path, device.path()))
+            && self.name.as_ref().map_or(true, |name| {
+                device
+                    .name()
+                    .to_str()
+                    .map_or(false, |device_name| device_name == name)
+            })
+            && self.vendor.map_or(true, |vendor| device.vendor() == vendor)
+            && self
+                .product
+                .map_or(true, |product| device.product() == product)
+            && self
+                .version
+                .map_or(true, |version| device.version() == version)
+    }
+}
+
+fn path_matches(configured: &Path, candidate: &Path) -> bool {
+    if configured == candidate {
+        return true;
+    }
+
+    match (
+        std::fs::canonicalize(configured),
+        std::fs::canonicalize(candidate),
+    ) {
+        (Ok(configured), Ok(candidate)) => configured == candidate,
+        _ => false,
+    }
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1235,5 +1294,27 @@ mod test {
     fn example_parses() {
         let config = include_str!("../../example/server.toml");
         toml::from_str::<Config>(config).unwrap();
+    }
+
+    #[test]
+    fn device_whitelist_parses() {
+        let config = r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["right-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+device-whitelist = [
+    { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
+    { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },
+]
+"#;
+
+        let config = toml::from_str::<Config>(config).unwrap();
+        let device_whitelist = config.device_whitelist.unwrap();
+
+        assert_eq!(device_whitelist.len(), 2);
+        assert!(!device_whitelist[0].is_empty());
+        assert!(!device_whitelist[1].is_empty());
     }
 }
