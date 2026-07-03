@@ -195,26 +195,25 @@ pub async fn run(
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            events = interceptor.read_frame() => {
-                                if events.is_err() | events_sender.send((id, events)).await.is_err() {
+                            frame = interceptor.read_frame() => {
+                                let input_lost = matches!(frame, Ok(Frame::InputLost));
+                                let failed = frame.is_err();
+                                if events_sender.send((id, frame)).await.is_err() || failed {
+                                    break;
+                                }
+                                if input_lost && !reset_local_device(id, &mut interceptor, &mut interceptor_receiver, &events_sender).await {
                                     break;
                                 }
                             }
-                            event = interceptor_receiver.recv() => {
-                                let event = match event {
-                                    Some(event) => event,
+                            command = interceptor_receiver.recv() => {
+                                let command = match command {
+                                    Some(command) => command,
                                     None => break,
                                 };
 
-                                match interceptor.write(&event).await {
-                                    Ok(()) => {},
-                                    Err(err) => {
-                                        let _ = events_sender.send((id, Err(err))).await;
-                                        break;
-                                    }
+                                if !handle_device_command(id, &mut interceptor, command, &events_sender).await {
+                                    break;
                                 }
-
-                                tracing::trace!(id = %id, "Wrote an event to device");
                             }
                         }
                     }
@@ -311,7 +310,7 @@ pub async fn run(
                             // while the main task is simultaneously sending events back to the interceptor.
                             // This creates a classic deadlock situation where both tasks are waiting for each other.
                             for event in events {
-                                match devices[id].sender.try_send(event) {
+                                match devices[id].sender.try_send(DeviceCommand::Event(event)) {
                                     Ok(()) | Err(TrySendError::Closed(_)) => {},
                                     Err(TrySendError::Full(_)) => return Err(Error::Overflow),
                                 }
@@ -337,6 +336,10 @@ pub async fn run(
                     }
                 }
                 Ok(Frame::InputLost) => {
+                    if !devices.contains(id) {
+                        continue;
+                    }
+
                     tracing::warn!(id = %id, "Input device lost synchronization; resetting routed state");
                     reset_routing_state(&mut current, &mut previous, &mut active_binding, &mut pressed_keys);
 
@@ -351,26 +354,36 @@ pub async fn run(
                             &mut previous,
                         );
                     }
-                }
-                Err(err) if err.kind() == ErrorKind::BrokenPipe => {
-                    let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
-                    for key in client_keys {
-                        try_send_update(
+
+                    let sender = devices[id].sender.clone();
+                    if sender.send(DeviceCommand::Reset).await.is_err() {
+                        destroy_device(
+                            &mut devices,
                             &mut clients,
-                            key,
-                            Update::DestroyDevice { id },
+                            id,
                             &mut current,
                             &mut previous,
                         );
                     }
-                    devices.remove(id);
-
-                    tracing::info!(id = %id, "Destroyed device");
+                }
+                Err(err) if err.kind() == ErrorKind::BrokenPipe => {
+                    destroy_device(
+                        &mut devices,
+                        &mut clients,
+                        id,
+                        &mut current,
+                        &mut previous,
+                    );
                 }
                 Err(err) => return Err(Error::Input(err)),
             }
         }
     }
+}
+
+enum DeviceCommand {
+    Event(Event),
+    Reset,
 }
 
 struct Device {
@@ -383,12 +396,57 @@ struct Device {
     keys: HashSet<Key>,
     delay: Option<i32>,
     period: Option<i32>,
-    sender: Sender<Event>,
+    sender: Sender<DeviceCommand>,
 }
 
 struct AuthenticatedClient {
     sender: Sender<Update>,
     addr: SocketAddr,
+}
+
+async fn handle_device_command(
+    id: usize,
+    interceptor: &mut rkvm_input::interceptor::Interceptor,
+    command: DeviceCommand,
+    events_sender: &Sender<(usize, Result<Frame, io::Error>)>,
+) -> bool {
+    let result = match command {
+        DeviceCommand::Event(event) => interceptor.write(&event).await,
+        DeviceCommand::Reset => interceptor.reset_writer().await,
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::trace!(id = %id, "Wrote a command to device");
+            true
+        }
+        Err(err) => {
+            let _ = events_sender.send((id, Err(err))).await;
+            false
+        }
+    }
+}
+
+async fn reset_local_device(
+    id: usize,
+    interceptor: &mut rkvm_input::interceptor::Interceptor,
+    interceptor_receiver: &mut Receiver<DeviceCommand>,
+    events_sender: &Sender<(usize, Result<Frame, io::Error>)>,
+) -> bool {
+    loop {
+        let command = match interceptor_receiver.recv().await {
+            Some(command) => command,
+            None => return false,
+        };
+        let reset = matches!(command, DeviceCommand::Reset);
+
+        if !handle_device_command(id, interceptor, command, events_sender).await {
+            return false;
+        }
+        if reset {
+            return true;
+        }
+    }
 }
 
 fn route_exists(clients: &Slab<(Sender<Update>, SocketAddr)>, idx: usize) -> bool {
@@ -428,6 +486,31 @@ fn reset_routing_state(
     *previous = 0;
     *active_binding = None;
     pressed_keys.clear();
+}
+
+fn destroy_device(
+    devices: &mut Slab<Device>,
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+    id: usize,
+    current: &mut usize,
+    previous: &mut usize,
+) {
+    if devices.try_remove(id).is_none() {
+        return;
+    }
+
+    let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
+    for key in client_keys {
+        try_send_update(
+            clients,
+            key,
+            Update::DestroyDevice { id },
+            current,
+            previous,
+        );
+    }
+
+    tracing::info!(id = %id, "Destroyed device");
 }
 
 fn reset_client_device(
@@ -779,6 +862,22 @@ mod tests {
         assert_eq!(previous, 0);
         assert!(active_binding.is_none());
         assert!(pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn local_reset_command_is_ordered_after_queued_events() {
+        let (sender, mut receiver) = mpsc::channel(2);
+
+        sender
+            .try_send(DeviceCommand::Event(Event::Sync(SyncEvent::All)))
+            .unwrap();
+        sender.try_send(DeviceCommand::Reset).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            DeviceCommand::Event(Event::Sync(SyncEvent::All))
+        ));
+        assert!(matches!(receiver.try_recv().unwrap(), DeviceCommand::Reset));
     }
 
     #[test]

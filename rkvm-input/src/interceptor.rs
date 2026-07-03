@@ -251,8 +251,7 @@ impl Interceptor {
 
         self.events.clear();
         self.writing = None;
-        self.drain_sync_events().map_err(recovery_error)?;
-        self.reset_writer().await.map_err(recovery_error)
+        self.drain_sync_events().map_err(recovery_error)
     }
 
     fn drain_sync_events(&self) -> Result<(), Error> {
@@ -265,7 +264,7 @@ impl Interceptor {
         }
     }
 
-    async fn reset_writer(&mut self) -> Result<(), Error> {
+    pub async fn reset_writer(&mut self) -> Result<(), Error> {
         self.writer.take();
         self.writer_handle.take();
 
