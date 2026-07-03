@@ -144,6 +144,7 @@ async fn run_once(
     let mut start = Instant::now();
 
     let mut interval = time::interval(rkvm_net::PING_INTERVAL + rkvm_net::READ_TIMEOUT);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut decode_buffer = Vec::new();
     let mut encode_buffer = Vec::new();
     let mut writers = HashMap::new();
@@ -156,6 +157,8 @@ async fn run_once(
             update = Update::decode_with_buffer(&mut stream, &mut decode_buffer) => update.map_err(Error::Network)?,
             _ = interval.tick() => return Err(Error::Network(io::Error::new(io::ErrorKind::TimedOut, "Ping timed out"))),
         };
+
+        interval.reset();
 
         match update {
             Update::CreateDevice {
@@ -246,7 +249,6 @@ async fn run_once(
                 tracing::debug!(duration = ?duration, "Received ping");
 
                 start = Instant::now();
-                interval.reset();
 
                 rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
                     Pong.encode_with_buffer(&mut stream, &mut encode_buffer).await?;

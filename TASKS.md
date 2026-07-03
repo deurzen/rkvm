@@ -2,16 +2,6 @@
 
 Priority order is based on expected impact on input latency/perceived speed first, then robustness, then implementation risk. Tasks are removed before the commit that completes them.
 
-## P2 — Make heartbeat traffic idle-only
-
-Prevent periodic pings from preempting input updates or blocking the per-client writer while waiting for a pong.
-
-Acceptance:
-- Treat any valid update received by the client as server liveness.
-- Server sends pings only after an idle period without queued updates.
-- Waiting for pong must not add avoidable latency to queued input updates.
-- Preserve disconnect detection for idle broken connections.
-
 ## P3 — Remove hot-path tracing overhead from input reads
 
 Avoid per-event span construction and dynamic path lookup in `Interceptor::read`.

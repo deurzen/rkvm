@@ -550,58 +550,102 @@ async fn authenticate(
     Ok(stream)
 }
 
-async fn client(
-    mut receiver: Receiver<Update>,
-    mut stream: ClientStream,
-) -> Result<(), ClientError> {
-    let mut interval = time::interval(rkvm_net::PING_INTERVAL);
-    let mut decode_buffer = Vec::new();
-    let mut encode_buffer = Vec::new();
+async fn client(mut receiver: Receiver<Update>, stream: ClientStream) -> Result<(), ClientError> {
+    let (mut read, mut write) = tokio::io::split(stream);
+    let (pong_sender, mut pong_receiver) = mpsc::channel(1);
+    let pong_handle = tokio::spawn(async move {
+        let mut decode_buffer = Vec::new();
 
-    loop {
-        let update = tokio::select! {
-            // Make sure pings have priority.
-            // The client could time out otherwise.
-            biased;
+        loop {
+            let result = Pong::decode_with_buffer(&mut read, &mut decode_buffer)
+                .await
+                .map(|_| ());
+            let failed = result.is_err();
+            if pong_sender.send(result).await.is_err() || failed {
+                break;
+            }
+        }
+    });
 
-            _ = interval.tick() => Some(Update::Ping),
-            recv = receiver.recv() => recv,
-        };
+    let result = async {
+        let mut interval = time::interval(rkvm_net::PING_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        interval.tick().await;
 
-        let update = match update {
-            Some(update) => update,
-            None => break,
-        };
+        let pong_timeout = time::sleep(rkvm_net::READ_TIMEOUT);
+        tokio::pin!(pong_timeout);
 
-        let start = Instant::now();
-        rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
-            update.encode_with_buffer(&mut stream, &mut encode_buffer).await?;
-            stream.flush().await?;
+        let mut encode_buffer = Vec::new();
+        let mut waiting_for_pong = false;
 
-            Ok(())
-        })
-        .await?;
-        let duration = start.elapsed();
+        loop {
+            tokio::select! {
+                biased;
 
-        if let Update::Ping = update {
-            // Keeping these as debug because it's not as frequent as other updates.
-            tracing::debug!(duration = ?duration, "Sent ping");
+                recv = receiver.recv() => {
+                    let update = match recv {
+                        Some(update) => update,
+                        None => break,
+                    };
 
-            let start = Instant::now();
-            rkvm_net::timeout(
-                rkvm_net::READ_TIMEOUT,
-                Pong::decode_with_buffer(&mut stream, &mut decode_buffer),
-            )
-            .await?;
-            let duration = start.elapsed();
+                    let start = Instant::now();
+                    rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
+                        update.encode_with_buffer(&mut write, &mut encode_buffer).await?;
+                        write.flush().await?;
 
-            tracing::debug!(duration = ?duration, "Received pong");
+                        Ok(())
+                    })
+                    .await?;
+                    let duration = start.elapsed();
+
+                    interval.reset();
+                    tracing::trace!(duration = ?duration, "Wrote an update");
+                }
+                result = pong_receiver.recv(), if waiting_for_pong => {
+                    match result {
+                        Some(Ok(())) => {
+                            waiting_for_pong = false;
+                            tracing::debug!("Received pong");
+                        }
+                        Some(Err(err)) => return Err(ClientError::Io(err)),
+                        None => return Err(ClientError::Io(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "Pong reader closed",
+                        ))),
+                    }
+                }
+                _ = &mut pong_timeout, if waiting_for_pong => {
+                    return Err(ClientError::Io(io::Error::new(
+                        ErrorKind::TimedOut,
+                        "Pong timed out",
+                    )));
+                }
+                _ = interval.tick(), if !waiting_for_pong => {
+                    let start = Instant::now();
+                    rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
+                        Update::Ping.encode_with_buffer(&mut write, &mut encode_buffer).await?;
+                        write.flush().await?;
+
+                        Ok(())
+                    })
+                    .await?;
+                    let duration = start.elapsed();
+
+                    waiting_for_pong = true;
+                    pong_timeout
+                        .as_mut()
+                        .reset(time::Instant::now() + rkvm_net::READ_TIMEOUT);
+                    tracing::debug!(duration = ?duration, "Sent ping");
+                }
+            }
         }
 
-        tracing::trace!("Wrote an update");
+        Ok(())
     }
+    .await;
 
-    Ok(())
+    pong_handle.abort();
+    result
 }
 
 #[cfg(test)]
