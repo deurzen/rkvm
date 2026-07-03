@@ -60,6 +60,7 @@ pub async fn run(
     let mut previous = 0;
     let mut active_binding: Option<HashSet<Key>> = None;
     let mut pressed_keys = HashSet::new();
+    let switch_keys = switch_key_set(switch_bindings);
 
     let (events_sender, mut events_receiver) = mpsc::channel(1);
     let (authenticated_sender, mut authenticated_receiver) = mpsc::channel(32);
@@ -253,7 +254,7 @@ pub async fn run(
                         };
 
                         if let Some((key, down)) = key_event {
-                            if binding_contains_key(switch_bindings, key) {
+                            if switch_keys.contains(&key) {
                                 switch_key = true;
 
                                 match down {
@@ -266,9 +267,7 @@ pub async fn run(
                         // Who to send this event to.
                         let mut idx = current;
 
-                        if let Some((key, down)) = key_event.filter(|(key, _)| {
-                            binding_contains_key(switch_bindings, *key)
-                        }) {
+                        if let Some((key, down)) = key_event.filter(|(key, _)| switch_keys.contains(key)) {
                             if let Some(binding) = &active_binding {
                                 if binding.contains(&key) {
                                     idx = previous;
@@ -398,8 +397,8 @@ fn next_route(clients: &Slab<(Sender<Update>, SocketAddr)>, current: usize) -> u
         .unwrap_or(0)
 }
 
-fn binding_contains_key(bindings: &[HashSet<Key>], key: Key) -> bool {
-    bindings.iter().any(|binding| binding.contains(&key))
+fn switch_key_set(bindings: &[HashSet<Key>]) -> HashSet<Key> {
+    bindings.iter().flatten().copied().collect()
 }
 
 fn matching_binding<'a>(
@@ -680,6 +679,28 @@ mod tests {
         assert_eq!(current, 0);
         assert_eq!(previous, 0);
         assert!(!route_exists(&clients, key + 1));
+    }
+
+    #[test]
+    fn switch_key_set_contains_union_of_bindings() {
+        let bindings = vec![
+            [
+                Key::Key(rkvm_input::key::Keyboard::LeftCtrl),
+                Key::Key(rkvm_input::key::Keyboard::Space),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            [Key::Key(rkvm_input::key::Keyboard::LeftAlt)]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        ];
+
+        let keys = switch_key_set(&bindings);
+
+        assert!(keys.contains(&Key::Key(rkvm_input::key::Keyboard::LeftCtrl)));
+        assert!(keys.contains(&Key::Key(rkvm_input::key::Keyboard::Space)));
+        assert!(keys.contains(&Key::Key(rkvm_input::key::Keyboard::LeftAlt)));
+        assert!(!keys.contains(&Key::Key(rkvm_input::key::Keyboard::A)));
     }
 
     #[test]
