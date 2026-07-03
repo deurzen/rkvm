@@ -1,6 +1,11 @@
 listen = "0.0.0.0:5258"
 # See `switch-keys.md` in the repository root for the list of all possible keys.
-switch-keys = ["left-alt", "left-ctrl"]
+# `switch-keys` is kept for compatibility and defines one chord.
+# switch-keys = ["left-alt", "left-ctrl"]
+switch-bindings = [
+    ["left-meta", "grave"],
+    ["left-ctrl", "space"],
+]
 # Whether switch key presses should be propagated on the server and its clients.
 # Optional, defaults to true.
 # propagate-switch-keys = true

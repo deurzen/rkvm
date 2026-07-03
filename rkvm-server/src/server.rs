@@ -40,7 +40,7 @@ pub async fn run(
     listen: SocketAddr,
     acceptor: TlsAcceptor,
     password: &str,
-    switch_keys: &HashSet<Key>,
+    switch_bindings: &[HashSet<Key>],
     propagate_switch_keys: bool,
     device_whitelist: Option<Vec<DeviceMatch>>,
     client_queue_size: usize,
@@ -58,7 +58,7 @@ pub async fn run(
     let mut clients = Slab::<(Sender<_>, SocketAddr)>::new();
     let mut current = 0;
     let mut previous = 0;
-    let mut changed = false;
+    let mut active_binding: Option<HashSet<Key>> = None;
     let mut pressed_keys = HashSet::new();
 
     let (events_sender, mut events_receiver) = mpsc::channel(1);
@@ -245,11 +245,16 @@ pub async fn run(
                     let mut routed = Vec::new();
 
                     for event in events {
-                        let mut press = false;
+                        let mut switch_key = false;
 
-                        if let Event::Key(KeyEvent { key, down }) = event {
-                            if switch_keys.contains(&key) {
-                                press = true;
+                        let key_event = match &event {
+                            Event::Key(KeyEvent { key, down }) => Some((*key, *down)),
+                            _ => None,
+                        };
+
+                        if let Some((key, down)) = key_event {
+                            if binding_contains_key(switch_bindings, key) {
+                                switch_key = true;
 
                                 match down {
                                     true => pressed_keys.insert(key),
@@ -261,33 +266,42 @@ pub async fn run(
                         // Who to send this event to.
                         let mut idx = current;
 
-                        if press {
-                            if pressed_keys.len() == switch_keys.len() {
-                                current = next_route(&clients, current);
-
-                                previous = idx;
-                                changed = true;
-
-                                if current != 0 {
-                                    tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
-                                } else {
-                                    tracing::info!(idx = %current, "Switched client");
+                        if let Some((key, down)) = key_event.filter(|(key, _)| {
+                            binding_contains_key(switch_bindings, *key)
+                        }) {
+                            if let Some(binding) = &active_binding {
+                                if binding.contains(&key) {
+                                    idx = previous;
                                 }
-                            } else if changed {
-                                idx = previous;
+                            } else if down {
+                                if let Some(binding) = matching_binding(switch_bindings, &pressed_keys, key) {
+                                    current = next_route(&clients, current);
 
-                                if pressed_keys.is_empty() {
-                                    changed = false;
+                                    previous = idx;
+                                    active_binding = Some(binding.clone());
+
+                                    if current != 0 {
+                                        tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
+                                    } else {
+                                        tracing::info!(idx = %current, "Switched client");
+                                    }
                                 }
+                            }
+
+                            if active_binding
+                                .as_ref()
+                                .map_or(false, |binding| binding.is_disjoint(&pressed_keys))
+                            {
+                                active_binding = None;
                             }
                         }
 
-                        if press && !propagate_switch_keys {
+                        if switch_key && !propagate_switch_keys {
                             continue;
                         }
 
                         routed.push((idx, event));
-                        if press {
+                        if switch_key {
                             routed.push((idx, Event::Sync(SyncEvent::All)));
                         }
                     }
@@ -382,6 +396,20 @@ fn next_route(clients: &Slab<(Sender<Update>, SocketAddr)>, current: usize) -> u
         .map(|(key, _)| key + 1)
         .find(|idx| *idx > current)
         .unwrap_or(0)
+}
+
+fn binding_contains_key(bindings: &[HashSet<Key>], key: Key) -> bool {
+    bindings.iter().any(|binding| binding.contains(&key))
+}
+
+fn matching_binding<'a>(
+    bindings: &'a [HashSet<Key>],
+    pressed_keys: &HashSet<Key>,
+    key: Key,
+) -> Option<&'a HashSet<Key>> {
+    bindings
+        .iter()
+        .find(|binding| binding.contains(&key) && binding.is_subset(pressed_keys))
 }
 
 fn remove_client(
@@ -607,5 +635,38 @@ mod tests {
         assert_eq!(current, 0);
         assert_eq!(previous, 0);
         assert!(!route_exists(&clients, key + 1));
+    }
+
+    #[test]
+    fn matching_binding_requires_complete_chord() {
+        let binding = [
+            Key::Key(rkvm_input::key::Keyboard::LeftCtrl),
+            Key::Key(rkvm_input::key::Keyboard::Space),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let bindings = vec![binding];
+        let partial = [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let complete = [
+            Key::Key(rkvm_input::key::Keyboard::LeftCtrl),
+            Key::Key(rkvm_input::key::Keyboard::Space),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+        assert!(matching_binding(
+            &bindings,
+            &partial,
+            Key::Key(rkvm_input::key::Keyboard::LeftCtrl)
+        )
+        .is_none());
+        assert!(matching_binding(
+            &bindings,
+            &complete,
+            Key::Key(rkvm_input::key::Keyboard::Space)
+        )
+        .is_some());
     }
 }

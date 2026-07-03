@@ -44,8 +44,8 @@ After installation:
   # cp /usr/share/rkvm/examples/client.toml /etc/rkvm/client.toml
   ```
   Do not edit the example configs, they will be overwritten by your package manager.
-- **Change the password** and optionally reconfigure the network listen address, key bindings for switching clients,
-  the per-client queue size (`client-queue-size`),
+- **Change the password** and optionally reconfigure the network listen address, key bindings for switching clients
+  (`switch-bindings`, or legacy `switch-keys` for one chord), the per-client queue size (`client-queue-size`),
   and `device-whitelist` if you only want rkvm to grab and forward selected input devices. Prefer stable
   `/dev/input/by-id/*-event-kbd` or `/dev/input/by-path/*-event-kbd` symlinks in the whitelist instead of
   `/dev/input/eventN` paths, because event numbers can change between boots. Use

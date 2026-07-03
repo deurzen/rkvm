@@ -3,8 +3,9 @@ mod server;
 mod tls;
 
 use clap::Parser;
-use config::{Config, DeviceMatch};
+use config::{Config, DeviceMatch, SwitchKey};
 use rkvm_input::monitor::list_devices;
+use std::collections::HashSet;
 use std::future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -85,6 +86,14 @@ async fn main() -> ExitCode {
         }
     }
 
+    let switch_bindings = match build_switch_bindings(&config) {
+        Ok(switch_bindings) => switch_bindings,
+        Err(err) => {
+            tracing::error!("Error parsing config: {}", err);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let acceptor = match tls::configure(&config.certificate, &config.key).await {
         Ok(acceptor) => acceptor,
         Err(err) => {
@@ -100,7 +109,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    let switch_keys = config.switch_keys.into_iter().map(Into::into).collect();
     let propagate_switch_keys = config.propagate_switch_keys.unwrap_or(true);
     let device_whitelist = config.device_whitelist;
 
@@ -109,7 +117,7 @@ async fn main() -> ExitCode {
             config.listen,
             acceptor,
             &config.password,
-            &switch_keys,
+            &switch_bindings,
             propagate_switch_keys,
             device_whitelist,
             client_queue_size,
@@ -134,6 +142,38 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn build_switch_bindings(
+    config: &Config,
+) -> Result<Vec<HashSet<rkvm_input::key::Key>>, &'static str> {
+    let mut bindings = Vec::new();
+
+    if let Some(switch_keys) = &config.switch_keys {
+        if switch_keys.is_empty() {
+            return Err("switch-keys must contain at least one key");
+        }
+        bindings.push(convert_switch_binding(switch_keys));
+    }
+
+    if let Some(switch_bindings) = &config.switch_bindings {
+        for binding in switch_bindings {
+            if binding.is_empty() {
+                return Err("switch-bindings entries must contain at least one key");
+            }
+            bindings.push(convert_switch_binding(binding));
+        }
+    }
+
+    if bindings.is_empty() {
+        return Err("either switch-keys or switch-bindings must be configured");
+    }
+
+    Ok(bindings)
+}
+
+fn convert_switch_binding(binding: &HashSet<SwitchKey>) -> HashSet<rkvm_input::key::Key> {
+    binding.iter().copied().map(Into::into).collect()
 }
 
 fn warn_on_broad_device_whitelist(device_whitelist: &Option<Vec<DeviceMatch>>) {

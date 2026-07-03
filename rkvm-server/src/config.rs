@@ -12,7 +12,8 @@ pub struct Config {
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub password: String,
-    pub switch_keys: HashSet<SwitchKey>,
+    pub switch_keys: Option<HashSet<SwitchKey>>,
+    pub switch_bindings: Option<Vec<HashSet<SwitchKey>>>,
     pub propagate_switch_keys: Option<bool>,
     pub device_whitelist: Option<Vec<DeviceMatch>>,
     pub client_queue_size: Option<usize>,
@@ -1335,5 +1336,24 @@ device-white-list = [
 "#;
 
         assert!(toml::from_str::<Config>(config).is_err());
+    }
+
+    #[test]
+    fn switch_bindings_parse() {
+        let config = r#"
+listen = "127.0.0.1:5258"
+switch-bindings = [["left-meta", "grave"], ["left-ctrl", "space"]]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+"#;
+
+        let config = toml::from_str::<Config>(config).unwrap();
+        let switch_bindings = config.switch_bindings.unwrap();
+
+        assert!(config.switch_keys.is_none());
+        assert_eq!(switch_bindings.len(), 2);
+        assert_eq!(switch_bindings[0].len(), 2);
+        assert_eq!(switch_bindings[1].len(), 2);
     }
 }
