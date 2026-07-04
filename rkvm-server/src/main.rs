@@ -144,24 +144,16 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn build_switch_bindings(
-    config: &Config,
-) -> Result<Vec<HashSet<rkvm_input::key::Key>>, &'static str> {
+fn build_switch_bindings(config: &Config) -> Result<Vec<server::SwitchBinding>, &'static str> {
     let mut bindings = Vec::new();
 
     if let Some(switch_keys) = &config.switch_keys {
-        if switch_keys.is_empty() {
-            return Err("switch-keys must contain at least one key");
-        }
-        bindings.push(convert_switch_binding(switch_keys));
+        bindings.push(convert_switch_binding(switch_keys, "switch-keys")?);
     }
 
     if let Some(switch_bindings) = &config.switch_bindings {
         for binding in switch_bindings {
-            if binding.is_empty() {
-                return Err("switch-bindings entries must contain at least one key");
-            }
-            bindings.push(convert_switch_binding(binding));
+            bindings.push(convert_switch_binding(binding, "switch-bindings entries")?);
         }
     }
 
@@ -172,8 +164,29 @@ fn build_switch_bindings(
     Ok(bindings)
 }
 
-fn convert_switch_binding(binding: &HashSet<SwitchKey>) -> HashSet<rkvm_input::key::Key> {
-    binding.iter().copied().map(Into::into).collect()
+fn convert_switch_binding(
+    binding: &[SwitchKey],
+    name: &'static str,
+) -> Result<server::SwitchBinding, &'static str> {
+    let Some(trigger) = binding.last().copied() else {
+        return Err(match name {
+            "switch-keys" => "switch-keys must contain at least one key",
+            _ => "switch-bindings entries must contain at least one key",
+        });
+    };
+
+    let mut seen = HashSet::new();
+    if !binding.iter().all(|key| seen.insert(*key)) {
+        return Err(match name {
+            "switch-keys" => "switch-keys must not contain duplicate keys",
+            _ => "switch-bindings entries must not contain duplicate keys",
+        });
+    }
+
+    Ok(server::SwitchBinding::new(
+        binding.iter().copied().map(Into::into).collect(),
+        trigger.into(),
+    ))
 }
 
 fn warn_on_broad_device_whitelist(device_whitelist: &Option<Vec<DeviceMatch>>) {
@@ -234,4 +247,67 @@ fn toml_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(data: &str) -> Config {
+        toml::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn switch_keys_reject_duplicate_keys() {
+        let config = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["left-ctrl", "left-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+"#,
+        );
+
+        assert_eq!(
+            build_switch_bindings(&config).unwrap_err(),
+            "switch-keys must not contain duplicate keys"
+        );
+    }
+
+    #[test]
+    fn switch_bindings_reject_empty_entries() {
+        let config = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-bindings = [[]]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+"#,
+        );
+
+        assert_eq!(
+            build_switch_bindings(&config).unwrap_err(),
+            "switch-bindings entries must contain at least one key"
+        );
+    }
+
+    #[test]
+    fn switch_bindings_reject_duplicate_keys() {
+        let config = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-bindings = [["left-ctrl", "space", "left-ctrl"]]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+"#,
+        );
+
+        assert_eq!(
+            build_switch_bindings(&config).unwrap_err(),
+            "switch-bindings entries must not contain duplicate keys"
+        );
+    }
 }

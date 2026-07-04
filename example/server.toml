@@ -1,6 +1,9 @@
 listen = "0.0.0.0:5258"
 # See `switch-keys.md` in the repository root for the list of all possible keys.
-# `switch-keys` is kept for compatibility and defines one chord.
+# Switch bindings are ordered: the last key in each binding is the activation
+# trigger. For example, ["left-ctrl", "space"] switches only when space is
+# pressed while left-ctrl is already held.
+# `switch-keys` is kept for compatibility and defines one ordered chord.
 # switch-keys = ["left-alt", "left-ctrl"]
 switch-bindings = [
     ["left-meta", "grave"],

@@ -1,7 +1,6 @@
 use rkvm_input::interceptor::DeviceInfo;
 use rkvm_input::key::{Button, Key, Keyboard};
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -12,8 +11,8 @@ pub struct Config {
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub password: String,
-    pub switch_keys: Option<HashSet<SwitchKey>>,
-    pub switch_bindings: Option<Vec<HashSet<SwitchKey>>>,
+    pub switch_keys: Option<Vec<SwitchKey>>,
+    pub switch_bindings: Option<Vec<Vec<SwitchKey>>>,
     pub propagate_switch_keys: Option<bool>,
     pub device_whitelist: Option<Vec<DeviceMatch>>,
     pub client_queue_size: Option<usize>,
@@ -76,7 +75,7 @@ fn path_matches(configured: &Path, candidate: &Path) -> bool {
     }
 }
 
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum SwitchKey {
     // Keys.
@@ -1353,7 +1352,13 @@ password = "123456789"
 
         assert!(config.switch_keys.is_none());
         assert_eq!(switch_bindings.len(), 2);
-        assert_eq!(switch_bindings[0].len(), 2);
-        assert_eq!(switch_bindings[1].len(), 2);
+        assert_eq!(
+            switch_bindings[0],
+            vec![SwitchKey::LeftMeta, SwitchKey::Grave]
+        );
+        assert_eq!(
+            switch_bindings[1],
+            vec![SwitchKey::LeftCtrl, SwitchKey::Space]
+        );
     }
 }

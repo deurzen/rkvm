@@ -37,11 +37,23 @@ pub enum Error {
     Overflow,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SwitchBinding {
+    keys: HashSet<Key>,
+    trigger: Key,
+}
+
+impl SwitchBinding {
+    pub(crate) fn new(keys: HashSet<Key>, trigger: Key) -> Self {
+        Self { keys, trigger }
+    }
+}
+
 pub async fn run(
     listen: SocketAddr,
     acceptor: TlsAcceptor,
     password: &str,
-    switch_bindings: &[HashSet<Key>],
+    switch_bindings: &[SwitchBinding],
     propagate_switch_keys: bool,
     device_whitelist: Option<Vec<DeviceMatch>>,
     client_queue_size: usize,
@@ -62,6 +74,7 @@ pub async fn run(
     let mut active_binding: Option<HashSet<Key>> = None;
     let mut pressed_keys = HashSet::new();
     let switch_keys = switch_key_set(switch_bindings);
+    let trigger_bindings = trigger_bindings(switch_bindings);
 
     let (events_sender, mut events_receiver) = mpsc::channel(1);
     let (authenticated_sender, mut authenticated_receiver) = mpsc::channel(32);
@@ -262,11 +275,16 @@ pub async fn run(
                                     idx = previous;
                                 }
                             } else if down {
-                                if let Some(binding) = matching_binding(switch_bindings, &pressed_keys, key) {
+                                if let Some(binding) = matching_binding(
+                                    switch_bindings,
+                                    &trigger_bindings,
+                                    &pressed_keys,
+                                    key,
+                                ) {
                                     current = next_route(&clients, current);
 
                                     previous = idx;
-                                    active_binding = Some(binding.clone());
+                                    active_binding = Some(binding.keys.clone());
 
                                     if current != 0 {
                                         tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
@@ -536,18 +554,32 @@ fn reset_client_device(
     )
 }
 
-fn switch_key_set(bindings: &[HashSet<Key>]) -> HashSet<Key> {
-    bindings.iter().flatten().copied().collect()
+fn switch_key_set(bindings: &[SwitchBinding]) -> HashSet<Key> {
+    bindings
+        .iter()
+        .flat_map(|binding| binding.keys.iter())
+        .copied()
+        .collect()
+}
+
+fn trigger_bindings(bindings: &[SwitchBinding]) -> HashMap<Key, Vec<usize>> {
+    let mut triggers = HashMap::<Key, Vec<usize>>::new();
+    for (idx, binding) in bindings.iter().enumerate() {
+        triggers.entry(binding.trigger).or_default().push(idx);
+    }
+    triggers
 }
 
 fn matching_binding<'a>(
-    bindings: &'a [HashSet<Key>],
+    bindings: &'a [SwitchBinding],
+    trigger_bindings: &HashMap<Key, Vec<usize>>,
     pressed_keys: &HashSet<Key>,
     key: Key,
-) -> Option<&'a HashSet<Key>> {
-    bindings
-        .iter()
-        .find(|binding| binding.contains(&key) && binding.is_subset(pressed_keys))
+) -> Option<&'a SwitchBinding> {
+    trigger_bindings.get(&key)?.iter().find_map(|idx| {
+        let binding = &bindings[*idx];
+        binding.keys.is_subset(pressed_keys).then_some(binding)
+    })
 }
 
 fn remove_client(
@@ -907,58 +939,119 @@ mod tests {
         ));
     }
 
+    fn key(key: rkvm_input::key::Keyboard) -> Key {
+        Key::Key(key)
+    }
+
+    fn switch_binding(keys: &[Key], trigger: Key) -> SwitchBinding {
+        SwitchBinding::new(keys.iter().copied().collect(), trigger)
+    }
+
     #[test]
     fn switch_key_set_contains_union_of_bindings() {
         let bindings = vec![
-            [
-                Key::Key(rkvm_input::key::Keyboard::LeftCtrl),
-                Key::Key(rkvm_input::key::Keyboard::Space),
-            ]
-            .into_iter()
-            .collect::<HashSet<_>>(),
-            [Key::Key(rkvm_input::key::Keyboard::LeftAlt)]
-                .into_iter()
-                .collect::<HashSet<_>>(),
+            switch_binding(
+                &[
+                    key(rkvm_input::key::Keyboard::LeftCtrl),
+                    key(rkvm_input::key::Keyboard::Space),
+                ],
+                key(rkvm_input::key::Keyboard::Space),
+            ),
+            switch_binding(
+                &[key(rkvm_input::key::Keyboard::LeftAlt)],
+                key(rkvm_input::key::Keyboard::LeftAlt),
+            ),
         ];
 
         let keys = switch_key_set(&bindings);
 
-        assert!(keys.contains(&Key::Key(rkvm_input::key::Keyboard::LeftCtrl)));
-        assert!(keys.contains(&Key::Key(rkvm_input::key::Keyboard::Space)));
-        assert!(keys.contains(&Key::Key(rkvm_input::key::Keyboard::LeftAlt)));
-        assert!(!keys.contains(&Key::Key(rkvm_input::key::Keyboard::A)));
+        assert!(keys.contains(&key(rkvm_input::key::Keyboard::LeftCtrl)));
+        assert!(keys.contains(&key(rkvm_input::key::Keyboard::Space)));
+        assert!(keys.contains(&key(rkvm_input::key::Keyboard::LeftAlt)));
+        assert!(!keys.contains(&key(rkvm_input::key::Keyboard::A)));
     }
 
     #[test]
-    fn matching_binding_requires_complete_chord() {
-        let binding = [
-            Key::Key(rkvm_input::key::Keyboard::LeftCtrl),
-            Key::Key(rkvm_input::key::Keyboard::Space),
-        ]
-        .into_iter()
-        .collect::<HashSet<_>>();
-        let bindings = vec![binding];
-        let partial = [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
+    fn matching_binding_requires_complete_chord_and_trigger_key() {
+        let bindings = vec![switch_binding(
+            &[
+                key(rkvm_input::key::Keyboard::LeftCtrl),
+                key(rkvm_input::key::Keyboard::Space),
+            ],
+            key(rkvm_input::key::Keyboard::Space),
+        )];
+        let triggers = trigger_bindings(&bindings);
+        let partial = [key(rkvm_input::key::Keyboard::LeftCtrl)]
             .into_iter()
             .collect::<HashSet<_>>();
         let complete = [
-            Key::Key(rkvm_input::key::Keyboard::LeftCtrl),
-            Key::Key(rkvm_input::key::Keyboard::Space),
+            key(rkvm_input::key::Keyboard::LeftCtrl),
+            key(rkvm_input::key::Keyboard::Space),
         ]
         .into_iter()
         .collect::<HashSet<_>>();
 
         assert!(matching_binding(
             &bindings,
+            &triggers,
             &partial,
-            Key::Key(rkvm_input::key::Keyboard::LeftCtrl)
+            key(rkvm_input::key::Keyboard::Space),
         )
         .is_none());
         assert!(matching_binding(
             &bindings,
+            &triggers,
             &complete,
-            Key::Key(rkvm_input::key::Keyboard::Space)
+            key(rkvm_input::key::Keyboard::LeftCtrl),
+        )
+        .is_none());
+        assert!(matching_binding(
+            &bindings,
+            &triggers,
+            &complete,
+            key(rkvm_input::key::Keyboard::Space),
         )
         .is_some());
+    }
+
+    #[test]
+    fn matching_binding_uses_config_order_for_shared_triggers() {
+        let bindings = vec![
+            switch_binding(
+                &[
+                    key(rkvm_input::key::Keyboard::LeftCtrl),
+                    key(rkvm_input::key::Keyboard::Space),
+                ],
+                key(rkvm_input::key::Keyboard::Space),
+            ),
+            switch_binding(
+                &[
+                    key(rkvm_input::key::Keyboard::LeftAlt),
+                    key(rkvm_input::key::Keyboard::Space),
+                ],
+                key(rkvm_input::key::Keyboard::Space),
+            ),
+        ];
+        let triggers = trigger_bindings(&bindings);
+        let pressed = [
+            key(rkvm_input::key::Keyboard::LeftCtrl),
+            key(rkvm_input::key::Keyboard::LeftAlt),
+            key(rkvm_input::key::Keyboard::Space),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+        let matched = matching_binding(
+            &bindings,
+            &triggers,
+            &pressed,
+            key(rkvm_input::key::Keyboard::Space),
+        )
+        .unwrap();
+
+        assert_eq!(matched.trigger, key(rkvm_input::key::Keyboard::Space));
+        assert!(matched
+            .keys
+            .contains(&key(rkvm_input::key::Keyboard::LeftCtrl)));
     }
 }
