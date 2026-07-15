@@ -325,12 +325,28 @@ fn origin_name(origin: DeviceOrigin) -> &'static str {
 fn bustype_name(bustype: u16) -> Option<&'static str> {
     Some(match bustype {
         0x0001 => "BUS_PCI",
+        0x0002 => "BUS_ISAPNP",
         0x0003 => "BUS_USB",
+        0x0004 => "BUS_HIL",
         0x0005 => "BUS_BLUETOOTH",
         0x0006 => "BUS_VIRTUAL",
         0x0010 => "BUS_ISA",
         0x0011 => "BUS_I8042",
-        0x0018 => "BUS_HOST",
+        0x0012 => "BUS_XTKBD",
+        0x0013 => "BUS_RS232",
+        0x0014 => "BUS_GAMEPORT",
+        0x0015 => "BUS_PARPORT",
+        0x0016 => "BUS_AMIGA",
+        0x0017 => "BUS_ADB",
+        0x0018 => "BUS_I2C",
+        0x0019 => "BUS_HOST",
+        0x001a => "BUS_GSC",
+        0x001b => "BUS_ATARI",
+        0x001c => "BUS_SPI",
+        0x001d => "BUS_RMI",
+        0x001e => "BUS_CEC",
+        0x001f => "BUS_INTEL_ISHTP",
+        0x0020 => "BUS_AMD_SFH",
         _ => return None,
     })
 }
@@ -372,6 +388,15 @@ mod tests {
 
     fn config(data: &str) -> Config {
         toml::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn input_bus_names_match_linux_ids() {
+        assert_eq!(bustype_name(0x0003), Some("BUS_USB"));
+        assert_eq!(bustype_name(0x0006), Some("BUS_VIRTUAL"));
+        assert_eq!(bustype_name(0x0018), Some("BUS_I2C"));
+        assert_eq!(bustype_name(0x0019), Some("BUS_HOST"));
+        assert_eq!(bustype_name(0xffff), None);
     }
 
     #[test]
