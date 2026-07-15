@@ -4,6 +4,7 @@ mod tls;
 
 use clap::Parser;
 use config::{Config, DeviceMatch, SwitchKey};
+use rkvm_input::interceptor::{DeviceCapabilities, DeviceOrigin};
 use rkvm_input::monitor::list_devices;
 use std::collections::HashSet;
 use std::future;
@@ -211,10 +212,18 @@ async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), s
         };
 
         println!("path = {}", info.path().display());
+        println!("sysfs-path = {}", info.sysfs_path().display());
+        println!("origin = {}", origin_name(info.origin()));
         println!("name = {:?}", info.name());
+        print!("bustype = 0x{:04x}", info.bustype());
+        if let Some(name) = bustype_name(info.bustype()) {
+            print!(" # {name}");
+        }
+        println!();
         println!("vendor = 0x{:04x}", info.vendor());
         println!("product = 0x{:04x}", info.product());
         println!("version = 0x{:04x}", info.version());
+        println!("capabilities = {}", capability_summary(info.capabilities()));
         println!("whitelisted = {}", whitelist);
 
         if device.aliases().is_empty() {
@@ -231,6 +240,41 @@ async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), s
     }
 
     Ok(())
+}
+
+fn origin_name(origin: DeviceOrigin) -> &'static str {
+    match origin {
+        DeviceOrigin::Physical => "physical",
+        DeviceOrigin::Virtual => "virtual",
+    }
+}
+
+fn bustype_name(bustype: u16) -> Option<&'static str> {
+    Some(match bustype {
+        0x0001 => "BUS_PCI",
+        0x0003 => "BUS_USB",
+        0x0005 => "BUS_BLUETOOTH",
+        0x0006 => "BUS_VIRTUAL",
+        0x0010 => "BUS_ISA",
+        0x0011 => "BUS_I8042",
+        0x0018 => "BUS_HOST",
+        _ => return None,
+    })
+}
+
+fn capability_summary(capabilities: DeviceCapabilities) -> String {
+    let mut names = Vec::new();
+    if capabilities.key {
+        names.push("key");
+    }
+    if capabilities.relative {
+        names.push("relative");
+    }
+    if capabilities.absolute {
+        names.push("absolute");
+    }
+
+    format!("[{}]", names.join(", "))
 }
 
 fn toml_string(value: &str) -> String {

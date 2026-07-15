@@ -1,4 +1,4 @@
-use rkvm_input::interceptor::DeviceInfo;
+use rkvm_input::interceptor::{DeviceInfo, DeviceOrigin};
 use rkvm_input::key::{Button, Key, Keyboard};
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -23,6 +23,8 @@ pub struct Config {
 pub struct DeviceMatch {
     pub path: Option<PathBuf>,
     pub name: Option<String>,
+    pub origin: Option<DeviceOrigin>,
+    pub bustype: Option<u16>,
     pub vendor: Option<u16>,
     pub product: Option<u16>,
     pub version: Option<u16>,
@@ -32,6 +34,8 @@ impl DeviceMatch {
     pub fn is_empty(&self) -> bool {
         self.path.is_none()
             && self.name.is_none()
+            && self.origin.is_none()
+            && self.bustype.is_none()
             && self.vendor.is_none()
             && self.product.is_none()
             && self.version.is_none()
@@ -51,6 +55,10 @@ impl DeviceMatch {
                     .to_str()
                     .map_or(false, |device_name| device_name == name)
             })
+            && self.origin.map_or(true, |origin| device.origin() == origin)
+            && self
+                .bustype
+                .map_or(true, |bustype| device.bustype() == bustype)
             && self.vendor.map_or(true, |vendor| device.vendor() == vendor)
             && self
                 .product
@@ -1308,7 +1316,7 @@ password = "123456789"
 client-queue-size = 128
 device-whitelist = [
     { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
-    { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },
+    { name = "Example Keyboard", origin = "physical", bustype = 0x0003, vendor = 0x1234, product = 0xabcd },
 ]
 "#;
 
@@ -1319,6 +1327,8 @@ device-whitelist = [
         assert_eq!(device_whitelist.len(), 2);
         assert!(!device_whitelist[0].is_empty());
         assert!(!device_whitelist[1].is_empty());
+        assert_eq!(device_whitelist[1].origin, Some(DeviceOrigin::Physical));
+        assert_eq!(device_whitelist[1].bustype, Some(0x0003));
     }
 
     #[test]

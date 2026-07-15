@@ -13,48 +13,105 @@ use crate::rel::{RelAxis, RelEvent};
 use crate::sync::SyncEvent;
 use crate::writer::Writer;
 
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::mem::MaybeUninit;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio::fs as async_fs;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceOrigin {
+    Physical,
+    Virtual,
+}
+
+impl DeviceOrigin {
+    fn from_sysfs_path(path: &Path) -> Self {
+        if path.starts_with("/sys/devices/virtual/input") {
+            Self::Virtual
+        } else {
+            Self::Physical
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceCapabilities {
+    pub key: bool,
+    pub relative: bool,
+    pub absolute: bool,
+}
 
 #[derive(Clone)]
 pub struct DeviceInfo {
     path: PathBuf,
+    sysfs_path: PathBuf,
+    origin: DeviceOrigin,
     name: CString,
+    bustype: u16,
     vendor: u16,
     product: u16,
     version: u16,
+    capabilities: DeviceCapabilities,
 }
 
 impl DeviceInfo {
     pub async fn open(path: &Path) -> Result<Self, Error> {
         let evdev = Evdev::open(path).await?;
-        Ok(Self::from_evdev(path, &evdev))
+        Self::from_evdev(path, &evdev).await
     }
 
-    fn from_evdev(path: &Path, evdev: &Evdev) -> Self {
+    async fn from_evdev(path: &Path, evdev: &Evdev) -> Result<Self, Error> {
         let name = unsafe { glue::libevdev_get_name(evdev.as_ptr()) };
         let name = unsafe { CStr::from_ptr(name) }.to_owned();
+        let metadata = evdev.file().unwrap().get_ref().metadata()?;
+        let sysfs_path = source_sysfs_path(&metadata).await?;
 
-        Self {
+        Ok(Self {
             path: path.to_owned(),
+            origin: DeviceOrigin::from_sysfs_path(&sysfs_path),
+            sysfs_path,
             name,
+            bustype: unsafe { glue::libevdev_get_id_bustype(evdev.as_ptr()) as _ },
             vendor: unsafe { glue::libevdev_get_id_vendor(evdev.as_ptr()) as _ },
             product: unsafe { glue::libevdev_get_id_product(evdev.as_ptr()) as _ },
             version: unsafe { glue::libevdev_get_id_version(evdev.as_ptr()) as _ },
-        }
+            capabilities: DeviceCapabilities {
+                key: unsafe { glue::libevdev_has_event_type(evdev.as_ptr(), glue::EV_KEY) == 1 },
+                relative: unsafe {
+                    glue::libevdev_has_event_type(evdev.as_ptr(), glue::EV_REL) == 1
+                },
+                absolute: unsafe {
+                    glue::libevdev_has_event_type(evdev.as_ptr(), glue::EV_ABS) == 1
+                },
+            },
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    pub fn sysfs_path(&self) -> &Path {
+        &self.sysfs_path
+    }
+
+    pub fn origin(&self) -> DeviceOrigin {
+        self.origin
+    }
+
     pub fn name(&self) -> &CStr {
         &self.name
+    }
+
+    pub fn bustype(&self) -> u16 {
+        self.bustype
     }
 
     pub fn vendor(&self) -> u16 {
@@ -68,6 +125,17 @@ impl DeviceInfo {
     pub fn version(&self) -> u16 {
         self.version
     }
+
+    pub fn capabilities(&self) -> DeviceCapabilities {
+        self.capabilities
+    }
+}
+
+async fn source_sysfs_path(metadata: &fs::Metadata) -> Result<PathBuf, Error> {
+    let device = metadata.rdev();
+    let major = unsafe { libc::major(device) };
+    let minor = unsafe { libc::minor(device) };
+    async_fs::canonicalize(format!("/sys/dev/char/{major}:{minor}/device")).await
 }
 
 fn input_error(ret: i32) -> Error {
@@ -352,7 +420,7 @@ impl Interceptor {
         F: Fn(&DeviceInfo) -> bool + ?Sized,
     {
         let evdev = Evdev::open(path).await?;
-        let info = DeviceInfo::from_evdev(path, &evdev);
+        let info = DeviceInfo::from_evdev(path, &evdev).await?;
 
         if !device_filter(&info) {
             tracing::info!(
@@ -464,4 +532,27 @@ pub(crate) enum OpenError {
     NotAppliable,
     #[error(transparent)]
     Io(#[from] Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sysfs_origin_detects_only_virtual_input_subtree() {
+        assert_eq!(
+            DeviceOrigin::from_sysfs_path(Path::new("/sys/devices/virtual/input/input12/event7")),
+            DeviceOrigin::Virtual
+        );
+        assert_eq!(
+            DeviceOrigin::from_sysfs_path(Path::new(
+                "/sys/devices/pci0000:00/usb1/1-1/input/input4/event3"
+            )),
+            DeviceOrigin::Physical
+        );
+        assert_eq!(
+            DeviceOrigin::from_sysfs_path(Path::new("/sys/devices/virtual/misc/uinput")),
+            DeviceOrigin::Physical
+        );
+    }
 }

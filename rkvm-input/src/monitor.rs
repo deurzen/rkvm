@@ -66,8 +66,19 @@ pub async fn list_devices() -> Result<Vec<CandidateDevice>, Error> {
             continue;
         }
 
-        let canonical_path = fs::canonicalize(&path).await?;
-        let info = DeviceInfo::open(&path).await?;
+        let canonical_path = match fs::canonicalize(&path).await {
+            Ok(path) => path,
+            Err(err) if is_disappearance(&err) => continue,
+            Err(err) => return Err(err),
+        };
+        let info = match DeviceInfo::open(&path).await {
+            Ok(info) => info,
+            Err(err) if is_disappearance(&err) => continue,
+            Err(err) => {
+                tracing::warn!(path = ?path, error = %err, "Unable to inspect input candidate");
+                continue;
+            }
+        };
         by_canonical_path.insert(canonical_path, devices.len());
         devices.push(CandidateDevice {
             info,
@@ -88,7 +99,11 @@ pub async fn list_devices() -> Result<Vec<CandidateDevice>, Error> {
                 continue;
             }
 
-            let canonical_path = fs::canonicalize(&path).await?;
+            let canonical_path = match fs::canonicalize(&path).await {
+                Ok(path) => path,
+                Err(err) if is_disappearance(&err) => continue,
+                Err(err) => return Err(err),
+            };
             if let Some(index) = by_canonical_path.get(&canonical_path) {
                 devices[*index].aliases.push(path);
             }
@@ -101,6 +116,10 @@ pub async fn list_devices() -> Result<Vec<CandidateDevice>, Error> {
     }
 
     Ok(devices)
+}
+
+fn is_disappearance(err: &Error) -> bool {
+    err.kind() == ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENODEV)
 }
 
 fn is_event_alias_directory(path: &Path) -> bool {
