@@ -33,6 +33,129 @@ const WATCH_MASK: WatchMask = WatchMask::CREATE
 pub type ActivationId = u64;
 type DeviceFilter = dyn Fn(&DeviceInfo) -> bool + Send + Sync;
 
+#[derive(Clone)]
+pub struct CandidatePolicy {
+    matcher: Arc<DeviceFilter>,
+    exact_path: Option<PathBuf>,
+    grab_delay: Duration,
+}
+
+impl CandidatePolicy {
+    pub fn new<F>(exact_path: Option<PathBuf>, grab_delay: Duration, matcher: F) -> Self
+    where
+        F: Fn(&DeviceInfo) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            matcher: Arc::new(matcher),
+            exact_path,
+            grab_delay,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GroupPolicy {
+    name: String,
+    candidates: Vec<CandidatePolicy>,
+}
+
+impl GroupPolicy {
+    pub fn new(name: String, candidates: Vec<CandidatePolicy>) -> Self {
+        Self { name, candidates }
+    }
+}
+
+#[derive(Clone)]
+enum Policy {
+    Legacy(Arc<DeviceFilter>),
+    Groups(Arc<Vec<GroupPolicy>>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Selection {
+    group: Option<usize>,
+    rule: usize,
+}
+
+impl Policy {
+    fn selection(&self, info: &DeviceInfo) -> Option<Selection> {
+        match self {
+            Self::Legacy(filter) => filter(info).then_some(Selection {
+                group: None,
+                rule: 0,
+            }),
+            Self::Groups(groups) => groups.iter().enumerate().find_map(|(group, policy)| {
+                policy
+                    .candidates
+                    .iter()
+                    .position(|candidate| (candidate.matcher)(info))
+                    .map(|rule| Selection {
+                        group: Some(group),
+                        rule,
+                    })
+            }),
+        }
+    }
+
+    fn log_cross_group_conflict(&self, info: &DeviceInfo) {
+        let Self::Groups(groups) = self else {
+            return;
+        };
+        let matches = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.candidates.iter().any(|rule| (rule.matcher)(info)))
+            .collect::<Vec<_>>();
+        if let Some((first_index, first)) = matches.first() {
+            for (_, conflicting) in matches.iter().skip(1) {
+                tracing::warn!(
+                    path = ?info.path(),
+                    first_group_index = *first_index + 1,
+                    first_group = %first.name,
+                    conflicting_group = %conflicting.name,
+                    "Input candidate matches multiple groups; first group owns precedence"
+                );
+            }
+        }
+    }
+
+    fn matches(&self, selection: Selection, info: &DeviceInfo) -> bool {
+        match (self, selection.group) {
+            (Self::Legacy(filter), None) => filter(info),
+            (Self::Groups(groups), Some(group)) => groups
+                .get(group)
+                .and_then(|group| group.candidates.get(selection.rule))
+                .map_or(false, |candidate| (candidate.matcher)(info)),
+            _ => false,
+        }
+    }
+
+    fn delay(&self, selection: Selection) -> Duration {
+        match (self, selection.group) {
+            (Self::Groups(groups), Some(group)) => {
+                groups[group].candidates[selection.rule].grab_delay
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn group_name(&self, selection: Selection) -> Option<&str> {
+        match (self, selection.group) {
+            (Self::Groups(groups), Some(group)) => Some(&groups[group].name),
+            _ => None,
+        }
+    }
+
+    fn exact_path(&self, selection: Selection) -> Option<&Path> {
+        match (self, selection.group) {
+            (Self::Groups(groups), Some(group)) => groups[group].candidates[selection.rule]
+                .exact_path
+                .as_deref(),
+            _ => None,
+        }
+    }
+}
+
 pub struct CandidateDevice {
     info: DeviceInfo,
     aliases: Vec<PathBuf>,
@@ -95,7 +218,26 @@ impl Monitor {
     {
         let (sender, receiver) = mpsc::channel(32);
         let (release_sender, release_receiver) = mpsc::channel(32);
-        tokio::spawn(monitor(sender, release_receiver, Arc::new(device_filter)));
+        tokio::spawn(monitor(
+            sender,
+            release_receiver,
+            Policy::Legacy(Arc::new(device_filter)),
+        ));
+
+        Self {
+            receiver,
+            release_sender,
+        }
+    }
+
+    pub fn with_groups(groups: Vec<GroupPolicy>) -> Self {
+        let (sender, receiver) = mpsc::channel(32);
+        let (release_sender, release_receiver) = mpsc::channel(32);
+        tokio::spawn(monitor(
+            sender,
+            release_receiver,
+            Policy::Groups(Arc::new(groups)),
+        ));
 
         Self {
             receiver,
@@ -166,6 +308,9 @@ impl RetryBackoff {
 
 #[derive(Debug)]
 enum CandidateState {
+    Deferred {
+        until: Instant,
+    },
     Ready,
     Waiting {
         until: Instant,
@@ -184,21 +329,27 @@ enum CandidateState {
 struct Candidate {
     info: DeviceInfo,
     aliases: BTreeSet<PathBuf>,
+    selection: Option<Selection>,
     state: CandidateState,
     backoff: RetryBackoff,
+    promotion_logged: bool,
 }
 
 impl Candidate {
-    fn new(info: DeviceInfo, aliases: BTreeSet<PathBuf>, device_filter: &DeviceFilter) -> Self {
-        let state = if device_filter(&info) {
+    fn new(info: DeviceInfo, aliases: BTreeSet<PathBuf>, policy: &Policy) -> Self {
+        policy.log_cross_group_conflict(&info);
+        let selection = policy.selection(&info);
+        let state = if let Some(selection) = selection {
             tracing::info!(
                 path = ?info.path(),
                 name = ?info.name(),
                 origin = ?info.origin(),
                 bustype = format_args!("0x{:04x}", info.bustype()),
+                group = policy.group_name(selection),
+                rule = selection.rule + 1,
                 "Discovered eligible input candidate"
             );
-            CandidateState::Ready
+            deferred_or_ready(policy.delay(selection))
         } else {
             tracing::info!(
                 path = ?info.path(),
@@ -216,15 +367,60 @@ impl Candidate {
         Self {
             info,
             aliases,
+            selection,
             state,
             backoff: RetryBackoff::new(),
+            promotion_logged: false,
         }
     }
 
     fn retry_at(&self) -> Option<Instant> {
         match self.state {
-            CandidateState::Waiting { until } | CandidateState::Blocked { until } => Some(until),
+            CandidateState::Deferred { until }
+            | CandidateState::Waiting { until }
+            | CandidateState::Blocked { until } => Some(until),
             _ => None,
+        }
+    }
+
+    fn update_policy(&mut self, policy: &Policy) -> bool {
+        let selection = policy.selection(&self.info);
+        if selection == self.selection {
+            return false;
+        }
+
+        self.selection = selection;
+        self.backoff.reset();
+        self.promotion_logged = false;
+        self.state = match selection {
+            Some(selection) => deferred_or_ready(policy.delay(selection)),
+            None => CandidateState::Rejected,
+        };
+        true
+    }
+
+    fn suppresses_lower_rules(&self) -> bool {
+        matches!(
+            self.state,
+            CandidateState::Deferred { .. }
+                | CandidateState::Ready
+                | CandidateState::Waiting { .. }
+                | CandidateState::Blocked { .. }
+                | CandidateState::Active { .. }
+        )
+    }
+}
+
+fn deferred_or_ready(delay: Duration) -> CandidateState {
+    if delay.is_zero() {
+        CandidateState::Ready
+    } else {
+        tracing::info!(
+            delay_ms = delay.as_millis(),
+            "Deferring input candidate grab"
+        );
+        CandidateState::Deferred {
+            until: Instant::now() + delay,
         }
     }
 }
@@ -258,7 +454,7 @@ impl Snapshot {
 async fn monitor(
     sender: Sender<Result<MonitorEvent, Error>>,
     mut release_receiver: Receiver<Release>,
-    device_filter: Arc<DeviceFilter>,
+    policy: Policy,
 ) {
     let run = async {
         let registry = Registry::new();
@@ -281,11 +477,11 @@ async fn monitor(
         inventory_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         inventory_interval.tick().await;
 
-        refresh_inventory(&registry, &mut candidates, &*device_filter, &sender).await?;
+        refresh_inventory(&registry, &mut candidates, &policy, &sender).await?;
         reconcile(
             &registry,
             &mut candidates,
-            &*device_filter,
+            &policy,
             &sender,
             &mut next_activation_id,
         )
@@ -333,7 +529,7 @@ async fn monitor(
                     refresh_inventory(
                         &registry,
                         &mut candidates,
-                        &*device_filter,
+                        &policy,
                         &sender,
                     )
                     .await?;
@@ -346,7 +542,7 @@ async fn monitor(
                     refresh_inventory(
                         &registry,
                         &mut candidates,
-                        &*device_filter,
+                        &policy,
                         &sender,
                     )
                     .await?;
@@ -355,26 +551,19 @@ async fn monitor(
                     refresh_inventory(
                         &registry,
                         &mut candidates,
-                        &*device_filter,
+                        &policy,
                         &sender,
                     )
                     .await?;
                 }
-                _ = retry => {
-                    for candidate in candidates.values_mut() {
-                        let expired = candidate.retry_at().map_or(false, |until| until <= Instant::now());
-                        if expired {
-                            candidate.state = CandidateState::Ready;
-                        }
-                    }
-                }
+                _ = retry => wake_expired(&mut candidates),
                 _ = sender.closed() => return Ok(()),
             }
 
             reconcile(
                 &registry,
                 &mut candidates,
-                &*device_filter,
+                &policy,
                 &sender,
                 &mut next_activation_id,
             )
@@ -428,7 +617,7 @@ async fn add_stream_watch_if_present(
 async fn refresh_inventory(
     registry: &Registry,
     candidates: &mut HashMap<Entry, Candidate>,
-    device_filter: &DeviceFilter,
+    policy: &Policy,
     sender: &Sender<Result<MonitorEvent, Error>>,
 ) -> Result<(), Error> {
     let mut snapshots = scan_devices(registry).await?;
@@ -445,10 +634,15 @@ async fn refresh_inventory(
                 let candidate = candidates.get_mut(&key).unwrap();
                 candidate.info = info;
                 candidate.aliases = aliases;
-                if !device_filter(&candidate.info) && active {
-                    request_removal(candidate, sender).await?;
-                } else if !device_filter(&candidate.info) {
-                    candidate.state = CandidateState::Rejected;
+                if active {
+                    let still_matches = candidate.selection.map_or(false, |selection| {
+                        policy.matches(selection, &candidate.info)
+                    });
+                    if !still_matches {
+                        request_removal(candidate, sender).await?;
+                    }
+                } else {
+                    candidate.update_policy(policy);
                 }
             }
             Some(Snapshot::Owned { aliases, .. }) if active => {
@@ -468,7 +662,7 @@ async fn refresh_inventory(
 
     for (key, snapshot) in snapshots {
         if let Snapshot::Candidate { info, aliases } = snapshot {
-            candidates.insert(key, Candidate::new(info, aliases, device_filter));
+            candidates.insert(key, Candidate::new(info, aliases, policy));
         }
     }
 
@@ -531,23 +725,19 @@ fn handle_release(candidates: &mut HashMap<Entry, Candidate>, release: Release) 
 async fn reconcile(
     registry: &Registry,
     candidates: &mut HashMap<Entry, Candidate>,
-    device_filter: &DeviceFilter,
+    policy: &Policy,
     sender: &Sender<Result<MonitorEvent, Error>>,
     next_activation_id: &mut ActivationId,
 ) -> Result<(), Error> {
-    let mut keys = candidates
-        .iter()
-        .filter_map(|(key, candidate)| {
-            matches!(candidate.state, CandidateState::Ready).then_some(*key)
-        })
-        .collect::<Vec<_>>();
-    keys.sort_by(|a, b| candidates[a].info.path().cmp(candidates[b].info.path()));
+    let keys = claim_order(policy, candidates);
 
     for key in keys {
         let path = candidates[&key].info.path().to_owned();
-        let mut result = Interceptor::claim(&path, key, registry, device_filter).await;
+        let selection = candidates[&key].selection.unwrap();
+        let still_matches = |info: &DeviceInfo| policy.matches(selection, info);
+        let mut result = Interceptor::claim(&path, key, registry, &still_matches).await;
         if matches!(result, Err(ClaimError::Interrupted(_))) {
-            result = Interceptor::claim(&path, key, registry, device_filter).await;
+            result = Interceptor::claim(&path, key, registry, &still_matches).await;
         }
 
         match result {
@@ -570,6 +760,8 @@ async fn reconcile(
                     name = ?candidate.info.name(),
                     origin = ?candidate.info.origin(),
                     bustype = format_args!("0x{:04x}", candidate.info.bustype()),
+                    group = policy.group_name(selection),
+                    rule = selection.rule + 1,
                     "Activated input candidate"
                 );
 
@@ -639,19 +831,150 @@ async fn reconcile(
     Ok(())
 }
 
+fn claim_order(policy: &Policy, candidates: &mut HashMap<Entry, Candidate>) -> Vec<Entry> {
+    let Policy::Groups(groups) = policy else {
+        let mut keys = candidates
+            .iter()
+            .filter_map(|(key, candidate)| {
+                matches!(candidate.state, CandidateState::Ready).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        keys.sort_by(|a, b| candidates[a].info.path().cmp(candidates[b].info.path()));
+        return keys;
+    };
+
+    let mut selected = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        let active_rule = candidates.values().find_map(|candidate| {
+            let selection = candidate.selection?;
+            (selection.group == Some(group_index)
+                && matches!(candidate.state, CandidateState::Active { .. }))
+            .then_some(selection.rule)
+        });
+
+        if let Some(active_rule) = active_rule {
+            for candidate in candidates.values_mut() {
+                let Some(selection) = candidate.selection else {
+                    continue;
+                };
+                if selection.group == Some(group_index)
+                    && selection.rule < active_rule
+                    && candidate.suppresses_lower_rules()
+                    && !candidate.promotion_logged
+                {
+                    tracing::info!(
+                        group = %group.name,
+                        active_rule = active_rule + 1,
+                        preferred_rule = selection.rule + 1,
+                        path = ?candidate.info.path(),
+                        "Preferred candidate appeared while fallback is active; promotion deferred"
+                    );
+                    candidate.promotion_logged = true;
+                }
+            }
+            continue;
+        }
+
+        let Some(rule) = candidates
+            .values()
+            .filter_map(|candidate| {
+                let selection = candidate.selection?;
+                (selection.group == Some(group_index) && candidate.suppresses_lower_rules())
+                    .then_some(selection.rule)
+            })
+            .min()
+        else {
+            continue;
+        };
+
+        let mut matching = candidates
+            .iter()
+            .filter_map(|(key, candidate)| {
+                let selection = candidate.selection?;
+                (selection.group == Some(group_index)
+                    && selection.rule == rule
+                    && candidate.suppresses_lower_rules())
+                .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        matching.sort_by(|a, b| {
+            let exact_a = reaches_exact_path(
+                &candidates[a],
+                policy.exact_path(candidates[a].selection.unwrap()),
+            );
+            let exact_b = reaches_exact_path(
+                &candidates[b],
+                policy.exact_path(candidates[b].selection.unwrap()),
+            );
+            exact_b
+                .cmp(&exact_a)
+                .then_with(|| candidates[a].info.path().cmp(candidates[b].info.path()))
+        });
+
+        if matching.len() > 1 {
+            tracing::warn!(
+                group = %group.name,
+                rule = rule + 1,
+                paths = ?matching.iter().map(|key| candidates[key].info.path()).collect::<Vec<_>>(),
+                "Input group rule matches multiple node instances; selecting deterministically"
+            );
+        }
+        if let Some(key) = matching.first().copied() {
+            if matches!(candidates[&key].state, CandidateState::Ready) {
+                selected.push(key);
+            }
+        }
+    }
+
+    selected
+}
+
+fn reaches_exact_path(candidate: &Candidate, exact_path: Option<&Path>) -> bool {
+    let Some(exact_path) = exact_path else {
+        return false;
+    };
+    if candidate.info.path() == exact_path || candidate.aliases.contains(exact_path) {
+        return true;
+    }
+    std::fs::canonicalize(exact_path)
+        .map(|path| path == candidate.info.path())
+        .unwrap_or(false)
+}
+
+fn wake_expired(candidates: &mut HashMap<Entry, Candidate>) {
+    for candidate in candidates.values_mut() {
+        let expired = candidate
+            .retry_at()
+            .map_or(false, |until| until <= Instant::now());
+        if expired {
+            candidate.state = CandidateState::Ready;
+        }
+    }
+}
+
 fn schedule_backoff(candidate: &mut Candidate, reason: &str) {
     let delay = candidate.backoff.next();
     let retry = candidate.backoff.failures;
     candidate.state = CandidateState::Waiting {
         until: Instant::now() + delay,
     };
-    tracing::info!(
-        path = ?candidate.info.path(),
-        reason,
-        retry,
-        delay_ms = delay.as_millis(),
-        "Input candidate unavailable; retry scheduled"
-    );
+    if retry <= RETRY_BACKOFF.len() || retry % 30 == 0 {
+        tracing::info!(
+            path = ?candidate.info.path(),
+            reason,
+            retry,
+            delay_ms = delay.as_millis(),
+            "Input candidate unavailable; retry scheduled"
+        );
+    } else {
+        tracing::debug!(
+            path = ?candidate.info.path(),
+            reason,
+            retry,
+            delay_ms = delay.as_millis(),
+            "Input candidate remains unavailable"
+        );
+    }
 }
 
 async fn scan_devices(registry: &Registry) -> Result<HashMap<Entry, Snapshot>, Error> {
@@ -762,6 +1085,142 @@ fn is_disappearance(err: &Error) -> bool {
 mod tests {
     use super::*;
 
+    fn entry(inode: u64) -> Entry {
+        Entry { device: 1, inode }
+    }
+
+    fn candidate(path: &str, policy: &Policy) -> Candidate {
+        Candidate::new(DeviceInfo::test(path), BTreeSet::new(), policy)
+    }
+
+    fn path_rule(path: &'static str, delay: Duration) -> CandidatePolicy {
+        CandidatePolicy::new(None, delay, move |info| info.path() == Path::new(path))
+    }
+
+    #[test]
+    fn group_precedence_and_exclusivity_select_one_candidate() {
+        let policy = Policy::Groups(Arc::new(vec![GroupPolicy::new(
+            "mouse".into(),
+            vec![
+                path_rule("/dev/input/event1", Duration::ZERO),
+                path_rule("/dev/input/event2", Duration::ZERO),
+            ],
+        )]));
+        let mut candidates = HashMap::from([
+            (entry(1), candidate("/dev/input/event1", &policy)),
+            (entry(2), candidate("/dev/input/event2", &policy)),
+        ]);
+
+        assert_eq!(claim_order(&policy, &mut candidates), vec![entry(1)]);
+        candidates.get_mut(&entry(2)).unwrap().state = CandidateState::Active {
+            activation_id: 3,
+            removal_sent: false,
+        };
+        assert!(claim_order(&policy, &mut candidates).is_empty());
+        assert!(candidates[&entry(1)].promotion_logged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preferred_candidate_wins_during_fallback_grace_period() {
+        let policy = Policy::Groups(Arc::new(vec![GroupPolicy::new(
+            "mouse".into(),
+            vec![
+                path_rule("/dev/input/event1", Duration::ZERO),
+                path_rule("/dev/input/event2", Duration::from_secs(1)),
+            ],
+        )]));
+        let mut candidates = HashMap::from([(entry(2), candidate("/dev/input/event2", &policy))]);
+
+        assert!(matches!(
+            candidates[&entry(2)].state,
+            CandidateState::Deferred { .. }
+        ));
+        assert!(claim_order(&policy, &mut candidates).is_empty());
+
+        candidates.insert(entry(1), candidate("/dev/input/event1", &policy));
+        assert_eq!(claim_order(&policy, &mut candidates), vec![entry(1)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absent_preferred_candidate_allows_fallback_after_grace_period() {
+        let policy = Policy::Groups(Arc::new(vec![GroupPolicy::new(
+            "mouse".into(),
+            vec![
+                path_rule("/dev/input/event1", Duration::ZERO),
+                path_rule("/dev/input/event2", Duration::from_secs(1)),
+            ],
+        )]));
+        let mut candidates = HashMap::from([(entry(2), candidate("/dev/input/event2", &policy))]);
+
+        assert!(claim_order(&policy, &mut candidates).is_empty());
+        time::advance(Duration::from_secs(1)).await;
+        wake_expired(&mut candidates);
+        assert_eq!(claim_order(&policy, &mut candidates), vec![entry(2)]);
+    }
+
+    #[test]
+    fn busy_preferred_candidate_suppresses_ready_fallback() {
+        let policy = Policy::Groups(Arc::new(vec![GroupPolicy::new(
+            "mouse".into(),
+            vec![
+                path_rule("/dev/input/event1", Duration::ZERO),
+                path_rule("/dev/input/event2", Duration::ZERO),
+            ],
+        )]));
+        let mut candidates = HashMap::from([
+            (entry(1), candidate("/dev/input/event1", &policy)),
+            (entry(2), candidate("/dev/input/event2", &policy)),
+        ]);
+        candidates.get_mut(&entry(1)).unwrap().state = CandidateState::Waiting {
+            until: Instant::now() + Duration::from_secs(1),
+        };
+
+        assert!(claim_order(&policy, &mut candidates).is_empty());
+        candidates.get_mut(&entry(1)).unwrap().state = CandidateState::Unsupported;
+        assert_eq!(claim_order(&policy, &mut candidates), vec![entry(2)]);
+    }
+
+    #[test]
+    fn exact_path_breaks_ties_within_one_rule() {
+        let policy = Policy::Groups(Arc::new(vec![GroupPolicy::new(
+            "mouse".into(),
+            vec![CandidatePolicy::new(
+                Some(PathBuf::from("/dev/input/event2")),
+                Duration::ZERO,
+                |_| true,
+            )],
+        )]));
+        let mut candidates = HashMap::from([
+            (entry(1), candidate("/dev/input/event1", &policy)),
+            (entry(2), candidate("/dev/input/event2", &policy)),
+        ]);
+
+        assert_eq!(claim_order(&policy, &mut candidates), vec![entry(2)]);
+    }
+
+    #[test]
+    fn first_group_owns_cross_group_candidate() {
+        let policy = Policy::Groups(Arc::new(vec![
+            GroupPolicy::new(
+                "first".into(),
+                vec![CandidatePolicy::new(None, Duration::ZERO, |_| true)],
+            ),
+            GroupPolicy::new(
+                "second".into(),
+                vec![CandidatePolicy::new(None, Duration::ZERO, |_| true)],
+            ),
+        ]));
+        let candidate = candidate("/dev/input/event1", &policy);
+
+        assert_eq!(
+            candidate.selection,
+            Some(Selection {
+                group: Some(0),
+                rule: 0
+            })
+        );
+    }
+
     #[test]
     fn retry_backoff_follows_bounded_schedule() {
         let mut backoff = RetryBackoff::new();
@@ -787,11 +1246,16 @@ mod tests {
             Candidate {
                 info: DeviceInfo::test("/dev/input/event1"),
                 aliases: BTreeSet::new(),
+                selection: Some(Selection {
+                    group: None,
+                    rule: 0,
+                }),
                 state: CandidateState::Active {
                     activation_id: 9,
                     removal_sent: false,
                 },
                 backoff: RetryBackoff::new(),
+                promotion_logged: false,
             },
         )]);
 

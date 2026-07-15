@@ -15,7 +15,24 @@ pub struct Config {
     pub switch_bindings: Option<Vec<Vec<SwitchKey>>>,
     pub propagate_switch_keys: Option<bool>,
     pub device_whitelist: Option<Vec<DeviceMatch>>,
+    pub device_groups: Option<Vec<DeviceGroup>>,
     pub client_queue_size: Option<usize>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DeviceGroup {
+    pub name: String,
+    #[serde(default)]
+    pub candidates: Vec<DeviceCandidate>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DeviceCandidate {
+    #[serde(flatten)]
+    pub matcher: DeviceMatch,
+    pub grab_delay_ms: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1298,6 +1315,30 @@ impl Into<Key> for SwitchKey {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn canonical_path_matching_accepts_aliases() {
+        let directory = std::env::temp_dir().join(format!(
+            "rkvm-path-match-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let canonical = directory.join("event1");
+        let alias = directory.join("stable-event");
+        std::fs::write(&canonical, []).unwrap();
+        symlink(&canonical, &alias).unwrap();
+
+        assert!(path_matches(&alias, &canonical));
+        assert!(path_matches(&canonical, &alias));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn example_parses() {
@@ -1329,6 +1370,44 @@ device-whitelist = [
         assert!(!device_whitelist[1].is_empty());
         assert_eq!(device_whitelist[1].origin, Some(DeviceOrigin::Physical));
         assert_eq!(device_whitelist[1].bustype, Some(0x0003));
+    }
+
+    #[test]
+    fn device_groups_parse_in_candidate_order() {
+        let config = r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["right-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+
+[[device-groups]]
+name = "mouse"
+
+[[device-groups.candidates]]
+name = "virtual mouse"
+origin = "virtual"
+bustype = 0x0003
+
+[[device-groups.candidates]]
+path = "/dev/input/by-id/example-mouse"
+origin = "physical"
+grab-delay-ms = 1000
+"#;
+
+        let config = toml::from_str::<Config>(config).unwrap();
+        let groups = config.device_groups.unwrap();
+        assert!(config.device_whitelist.is_none());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "mouse");
+        assert_eq!(groups[0].candidates.len(), 2);
+        assert_eq!(
+            groups[0].candidates[0].matcher.origin,
+            Some(DeviceOrigin::Virtual)
+        );
+        assert_eq!(groups[0].candidates[0].matcher.bustype, Some(0x0003));
+        assert_eq!(groups[0].candidates[0].grab_delay_ms, None);
+        assert_eq!(groups[0].candidates[1].grab_delay_ms, Some(1000));
     }
 
     #[test]

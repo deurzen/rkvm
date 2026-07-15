@@ -3,7 +3,7 @@ mod server;
 mod tls;
 
 use clap::Parser;
-use config::{Config, DeviceMatch, SwitchKey};
+use config::{Config, DeviceGroup, DeviceMatch, SwitchKey};
 use rkvm_input::interceptor::{DeviceCapabilities, DeviceOrigin};
 use rkvm_input::monitor::list_devices;
 use std::collections::HashSet;
@@ -57,14 +57,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    if config
-        .device_whitelist
-        .as_ref()
-        .map_or(false, |items| items.iter().any(|item| item.is_empty()))
-    {
-        tracing::error!(
-            "Error parsing config: device-whitelist entries must contain at least one match field"
-        );
+    if let Err(err) = validate_device_policy(&config) {
+        tracing::error!("Error parsing config: {}", err);
         return ExitCode::FAILURE;
     }
 
@@ -78,7 +72,12 @@ async fn main() -> ExitCode {
     warn_on_broad_device_whitelist(&config.device_whitelist);
 
     if args.list_devices {
-        match print_devices(config.device_whitelist.as_deref()).await {
+        match print_devices(
+            config.device_whitelist.as_deref(),
+            config.device_groups.as_deref(),
+        )
+        .await
+        {
             Ok(()) => return ExitCode::SUCCESS,
             Err(err) => {
                 tracing::error!("Error listing input devices: {}", err);
@@ -112,6 +111,7 @@ async fn main() -> ExitCode {
 
     let propagate_switch_keys = config.propagate_switch_keys.unwrap_or(true);
     let device_whitelist = config.device_whitelist;
+    let device_groups = config.device_groups;
 
     tokio::select! {
         result = server::run(
@@ -121,6 +121,7 @@ async fn main() -> ExitCode {
             &switch_bindings,
             propagate_switch_keys,
             device_whitelist,
+            device_groups,
             client_queue_size,
         ) => {
             if let Err(err) = result {
@@ -190,6 +191,52 @@ fn convert_switch_binding(
     ))
 }
 
+fn validate_device_policy(config: &Config) -> Result<(), String> {
+    if config.device_whitelist.is_some() && config.device_groups.is_some() {
+        return Err("device-whitelist and device-groups are mutually exclusive".into());
+    }
+    if config
+        .device_whitelist
+        .as_ref()
+        .map_or(false, |items| items.iter().any(DeviceMatch::is_empty))
+    {
+        return Err("device-whitelist entries must contain at least one match field".into());
+    }
+
+    if let Some(groups) = &config.device_groups {
+        if groups.is_empty() {
+            return Err("device-groups must contain at least one group".into());
+        }
+        let mut names = HashSet::new();
+        for group in groups {
+            if group.name.trim().is_empty() {
+                return Err("device-group names must not be empty".into());
+            }
+            if !names.insert(&group.name) {
+                return Err(format!("duplicate device-group name {:?}", group.name));
+            }
+            if group.candidates.is_empty() {
+                return Err(format!(
+                    "device-group {:?} must contain at least one candidate",
+                    group.name
+                ));
+            }
+            if group
+                .candidates
+                .iter()
+                .any(|candidate| candidate.matcher.is_empty())
+            {
+                return Err(format!(
+                    "device-group {:?} candidates must contain at least one match field",
+                    group.name
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn warn_on_broad_device_whitelist(device_whitelist: &Option<Vec<DeviceMatch>>) {
     let Some(device_whitelist) = device_whitelist else {
         return;
@@ -202,7 +249,10 @@ fn warn_on_broad_device_whitelist(device_whitelist: &Option<Vec<DeviceMatch>>) {
     }
 }
 
-async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), std::io::Error> {
+async fn print_devices(
+    device_whitelist: Option<&[DeviceMatch]>,
+    device_groups: Option<&[DeviceGroup]>,
+) -> Result<(), std::io::Error> {
     for device in list_devices().await? {
         let info = device.info();
         let whitelist = match device_whitelist {
@@ -210,6 +260,15 @@ async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), s
             Some(_) => "no",
             None => "disabled",
         };
+        let group_match = device_groups.and_then(|groups| {
+            groups.iter().enumerate().find_map(|(group_index, group)| {
+                group
+                    .candidates
+                    .iter()
+                    .position(|candidate| candidate.matcher.matches(info))
+                    .map(|candidate_index| (group_index, group, candidate_index))
+            })
+        });
 
         println!("path = {}", info.path().display());
         println!("sysfs-path = {}", info.sysfs_path().display());
@@ -225,6 +284,20 @@ async fn print_devices(device_whitelist: Option<&[DeviceMatch]>) -> Result<(), s
         println!("version = 0x{:04x}", info.version());
         println!("capabilities = {}", capability_summary(info.capabilities()));
         println!("whitelisted = {}", whitelist);
+        match (device_groups, group_match) {
+            (Some(_), Some((group_index, group, candidate_index))) => {
+                let candidate = &group.candidates[candidate_index];
+                println!("matching-group = {}", toml_string(&group.name));
+                println!("matching-group-index = {}", group_index + 1);
+                println!("matching-candidate-index = {}", candidate_index + 1);
+                println!(
+                    "configured-grab-delay-ms = {}",
+                    candidate.grab_delay_ms.unwrap_or_default()
+                );
+            }
+            (Some(_), None) => println!("matching-group = none"),
+            (None, _) => println!("matching-group = disabled"),
+        }
 
         if device.aliases().is_empty() {
             println!("aliases = []");
@@ -299,6 +372,96 @@ mod tests {
 
     fn config(data: &str) -> Config {
         toml::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn device_policy_rejects_legacy_and_group_configuration_together() {
+        let config = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["left-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+device-whitelist = [{ name = "keyboard" }]
+
+[[device-groups]]
+name = "keyboard"
+[[device-groups.candidates]]
+name = "keyboard"
+"#,
+        );
+
+        assert_eq!(
+            validate_device_policy(&config).unwrap_err(),
+            "device-whitelist and device-groups are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn device_policy_rejects_duplicate_and_empty_groups() {
+        let duplicate = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["left-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+
+[[device-groups]]
+name = "mouse"
+[[device-groups.candidates]]
+name = "mouse"
+
+[[device-groups]]
+name = "mouse"
+[[device-groups.candidates]]
+name = "other mouse"
+"#,
+        );
+        assert_eq!(
+            validate_device_policy(&duplicate).unwrap_err(),
+            "duplicate device-group name \"mouse\""
+        );
+
+        let empty = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["left-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+
+[[device-groups]]
+name = "keyboard"
+"#,
+        );
+        assert_eq!(
+            validate_device_policy(&empty).unwrap_err(),
+            "device-group \"keyboard\" must contain at least one candidate"
+        );
+    }
+
+    #[test]
+    fn device_policy_rejects_empty_candidate_match() {
+        let config = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-keys = ["left-ctrl"]
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+
+[[device-groups]]
+name = "keyboard"
+[[device-groups.candidates]]
+grab-delay-ms = 1000
+"#,
+        );
+        assert_eq!(
+            validate_device_policy(&config).unwrap_err(),
+            "device-group \"keyboard\" candidates must contain at least one match field"
+        );
     }
 
     #[test]

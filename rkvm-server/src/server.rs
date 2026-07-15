@@ -1,9 +1,11 @@
-use crate::config::DeviceMatch;
+use crate::config::{DeviceGroup, DeviceMatch};
 use rkvm_input::abs::{AbsAxis, AbsInfo};
 use rkvm_input::event::Event;
 use rkvm_input::interceptor::Frame;
 use rkvm_input::key::{Key, KeyEvent};
-use rkvm_input::monitor::{ActivationId, Monitor, MonitorEvent, ReleaseCause};
+use rkvm_input::monitor::{
+    ActivationId, CandidatePolicy, GroupPolicy, Monitor, MonitorEvent, ReleaseCause,
+};
 use rkvm_input::rel::RelAxis;
 use rkvm_input::sync::SyncEvent;
 use rkvm_net::auth::{AuthChallenge, AuthResponse, AuthStatus};
@@ -15,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
@@ -57,16 +59,40 @@ pub async fn run(
     switch_bindings: &[SwitchBinding],
     propagate_switch_keys: bool,
     device_whitelist: Option<Vec<DeviceMatch>>,
+    device_groups: Option<Vec<DeviceGroup>>,
     client_queue_size: usize,
 ) -> Result<(), Error> {
     let listener = TcpListener::bind(&listen).await.map_err(Error::Network)?;
     tracing::info!("Listening on {}", listen);
 
-    let mut monitor = match device_whitelist {
-        Some(device_whitelist) => Monitor::with_filter(move |device| {
+    let mut monitor = match (device_whitelist, device_groups) {
+        (_, Some(groups)) => Monitor::with_groups(
+            groups
+                .into_iter()
+                .map(|group| {
+                    GroupPolicy::new(
+                        group.name,
+                        group
+                            .candidates
+                            .into_iter()
+                            .map(|candidate| {
+                                let exact_path = candidate.matcher.path.clone();
+                                let delay = Duration::from_millis(
+                                    candidate.grab_delay_ms.unwrap_or_default(),
+                                );
+                                CandidatePolicy::new(exact_path, delay, move |device| {
+                                    candidate.matcher.matches(device)
+                                })
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+        (Some(device_whitelist), None) => Monitor::with_filter(move |device| {
             device_whitelist.iter().any(|item| item.matches(device))
         }),
-        None => Monitor::new(),
+        (None, None) => Monitor::new(),
     };
     let mut devices = Slab::<Device>::new();
     let mut clients = Slab::<(Sender<_>, SocketAddr)>::new();

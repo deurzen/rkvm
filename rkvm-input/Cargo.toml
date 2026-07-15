@@ -11,7 +11,7 @@ serde = { version = "1.0.117", features = ["derive"] }
 futures = "0.3.8"
 smallvec = { version = "1.10.0", features = ["serde"] }
 inotify = "0.10.0"
-tokio = { version = "1.0.1", features = ["fs", "io-util", "net", "sync", "rt", "time", "macros"] }
+tokio = { version = "1.0.1", features = ["fs", "io-util", "net", "sync", "rt", "time", "macros", "test-util"] }
 libc = "0.2.77"
 thiserror = "1.0.40"
 tracing = "0.1.37"
