@@ -72,7 +72,7 @@ pub async fn run(
     let mut current = 0;
     let mut previous = 0;
     let mut active_binding: Option<HashSet<Key>> = None;
-    let mut pressed_keys = HashSet::new();
+    let mut pressed_keys = HashMap::<usize, HashSet<Key>>::new();
     let switch_keys = switch_key_set(switch_bindings);
     let trigger_bindings = trigger_bindings(switch_bindings);
 
@@ -259,10 +259,14 @@ pub async fn run(
                             if switch_keys.contains(&key) {
                                 switch_key = true;
 
+                                let device_keys = pressed_keys.entry(id).or_default();
                                 match down {
-                                    true => pressed_keys.insert(key),
-                                    false => pressed_keys.remove(&key),
+                                    true => device_keys.insert(key),
+                                    false => device_keys.remove(&key),
                                 };
+                                if device_keys.is_empty() {
+                                    pressed_keys.remove(&id);
+                                }
                             }
                         }
 
@@ -275,10 +279,11 @@ pub async fn run(
                                     idx = previous;
                                 }
                             } else if down {
+                                let pressed_key_union = pressed_key_union(&pressed_keys);
                                 if let Some(binding) = matching_binding(
                                     switch_bindings,
                                     &trigger_bindings,
-                                    &pressed_keys,
+                                    &pressed_key_union,
                                     key,
                                 ) {
                                     current = next_route(&clients, current);
@@ -294,9 +299,10 @@ pub async fn run(
                                 }
                             }
 
+                            let pressed_key_union = pressed_key_union(&pressed_keys);
                             if active_binding
                                 .as_ref()
-                                .map_or(false, |binding| binding.is_disjoint(&pressed_keys))
+                                .map_or(false, |binding| binding.is_disjoint(&pressed_key_union))
                             {
                                 active_binding = None;
                             }
@@ -381,6 +387,8 @@ pub async fn run(
                             id,
                             &mut current,
                             &mut previous,
+                            &mut active_binding,
+                            &mut pressed_keys,
                         );
                     }
                 }
@@ -391,6 +399,8 @@ pub async fn run(
                         id,
                         &mut current,
                         &mut previous,
+                        &mut active_binding,
+                        &mut pressed_keys,
                     );
                 }
                 Err(err) => return Err(Error::Input(err)),
@@ -498,7 +508,7 @@ fn reset_routing_state(
     current: &mut usize,
     previous: &mut usize,
     active_binding: &mut Option<HashSet<Key>>,
-    pressed_keys: &mut HashSet<Key>,
+    pressed_keys: &mut HashMap<usize, HashSet<Key>>,
 ) {
     *current = 0;
     *previous = 0;
@@ -512,9 +522,20 @@ fn destroy_device(
     id: usize,
     current: &mut usize,
     previous: &mut usize,
+    active_binding: &mut Option<HashSet<Key>>,
+    pressed_keys: &mut HashMap<usize, HashSet<Key>>,
 ) {
     if devices.try_remove(id).is_none() {
         return;
+    }
+
+    pressed_keys.remove(&id);
+    let pressed_key_union = pressed_key_union(pressed_keys);
+    if active_binding
+        .as_ref()
+        .map_or(false, |binding| binding.is_disjoint(&pressed_key_union))
+    {
+        *active_binding = None;
     }
 
     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
@@ -552,6 +573,14 @@ fn reset_client_device(
         current,
         previous,
     )
+}
+
+fn pressed_key_union(pressed_keys: &HashMap<usize, HashSet<Key>>) -> HashSet<Key> {
+    pressed_keys
+        .values()
+        .flat_map(|keys| keys.iter())
+        .copied()
+        .collect()
 }
 
 fn switch_key_set(bindings: &[SwitchBinding]) -> HashSet<Key> {
@@ -879,9 +908,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let mut pressed_keys = [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
-            .into_iter()
-            .collect();
+        let mut pressed_keys = HashMap::from([(
+            7,
+            [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
+                .into_iter()
+                .collect(),
+        )]);
 
         reset_routing_state(
             &mut current,
@@ -894,6 +926,76 @@ mod tests {
         assert_eq!(previous, 0);
         assert!(active_binding.is_none());
         assert!(pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn destroying_device_clears_only_its_switch_state() {
+        let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
+        let alt = Key::Key(rkvm_input::key::Keyboard::LeftAlt);
+        let mut devices = Slab::new();
+        let removed = devices.insert(test_device());
+        let remaining = devices.insert(test_device());
+        let mut clients = Slab::new();
+        let mut current = 2;
+        let mut previous = 1;
+        let mut active_binding = Some([ctrl].into_iter().collect());
+        let mut pressed_keys = HashMap::from([
+            (removed, [ctrl].into_iter().collect()),
+            (remaining, [alt].into_iter().collect()),
+        ]);
+
+        destroy_device(
+            &mut devices,
+            &mut clients,
+            removed,
+            &mut current,
+            &mut previous,
+            &mut active_binding,
+            &mut pressed_keys,
+        );
+
+        assert!(!devices.contains(removed));
+        assert!(devices.contains(remaining));
+        assert!(!pressed_keys.contains_key(&removed));
+        assert_eq!(
+            pressed_key_union(&pressed_keys),
+            [alt].into_iter().collect()
+        );
+        assert!(active_binding.is_none());
+        assert_eq!(current, 2);
+        assert_eq!(previous, 1);
+    }
+
+    #[test]
+    fn destroying_device_preserves_binding_held_on_another_device() {
+        let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
+        let mut devices = Slab::new();
+        let removed = devices.insert(test_device());
+        let remaining = devices.insert(test_device());
+        let mut clients = Slab::new();
+        let mut current = 0;
+        let mut previous = 0;
+        let mut active_binding = Some([ctrl].into_iter().collect());
+        let mut pressed_keys = HashMap::from([
+            (removed, [ctrl].into_iter().collect()),
+            (remaining, [ctrl].into_iter().collect()),
+        ]);
+
+        destroy_device(
+            &mut devices,
+            &mut clients,
+            removed,
+            &mut current,
+            &mut previous,
+            &mut active_binding,
+            &mut pressed_keys,
+        );
+
+        assert!(active_binding.is_some());
+        assert_eq!(
+            pressed_key_union(&pressed_keys),
+            [ctrl].into_iter().collect()
+        );
     }
 
     #[test]
