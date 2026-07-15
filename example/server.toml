@@ -18,17 +18,55 @@ switch-bindings = [
 # Optional, defaults to 256.
 # client-queue-size = 256
 
-# Optional input device allowlist. If unset, rkvm keeps the current behavior and
-# grabs every applicable /dev/input/event* device. If set, only matching devices
-# are grabbed and forwarded. Match fields in one table are ANDed; tables are ORed.
-# Prefer stable /dev/input/by-id/*-event-kbd or /dev/input/by-path/*-event-kbd
-# symlinks over /dev/input/eventN paths. Vendor/product-only rules can match
-# multiple event nodes from one physical device or USB receiver. Run
-# `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidates.
+# Optional input policy. If neither policy is configured, rkvm keeps the
+# historical behavior and grabs every applicable /dev/input/event* device.
+# `device-whitelist` and `device-groups` are mutually exclusive.
+#
+# A whitelist ORs its entries; fields within one entry are ANDed. Prefer stable
+# by-id/by-path aliases over eventN paths. Vendor/product-only rules can match
+# multiple event nodes from one physical device or receiver.
 # device-whitelist = [
 #     { path = "/dev/input/by-id/usb-Example_keyboard-event-kbd" },
 #     { name = "Example Keyboard", vendor = 0x1234, product = 0xabcd },
 # ]
+#
+# Ordered groups model one logical peripheral with multiple possible sources.
+# At most one candidate per group is active. A present preferred candidate that
+# is deferred, busy, or permission-blocked suppresses lower candidates. The
+# delay starts when that exact node instance first appears and matches. An active
+# fallback is not live-replaced if a preferred source appears later.
+#
+# [[device-groups]]
+# name = "primary-keyboard"
+#
+# # Fail closed: only consume the post-processor keyboard, preserving remaps.
+# [[device-groups.candidates]]
+# name = "Example Keyboard"
+# vendor = 0x1234
+# product = 0xabcd
+# version = 0x0000
+# origin = "virtual"
+# bustype = 0x0003 # BUS_USB preserved by the processor's uinput clone
+#
+# [[device-groups]]
+# name = "primary-mouse"
+#
+# [[device-groups.candidates]]
+# name = "Example Mouse"
+# vendor = 0x1234
+# product = 0xbcde
+# version = 0x0000
+# origin = "virtual"
+# bustype = 0x0003
+#
+# # Use the exact physical mouse only if no preferred clone becomes available.
+# [[device-groups.candidates]]
+# path = "/dev/input/by-id/usb-Example_Mouse-event-mouse"
+# origin = "physical"
+# grab-delay-ms = 1000
+#
+# Run `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect canonical
+# paths, aliases, sysfs origin, source bus IDs, capabilities, and policy matches.
 
 certificate = "/etc/rkvm/certificate.pem"
 key = "/etc/rkvm/key.pem"

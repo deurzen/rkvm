@@ -46,15 +46,17 @@ After installation:
   Do not edit the example configs, they will be overwritten by your package manager.
 - **Change the password** and optionally reconfigure the network listen address, key bindings for switching clients
   (`switch-bindings`, or legacy `switch-keys` for one chord), the per-client queue size (`client-queue-size`),
-  and `device-whitelist` if you only want rkvm to grab and forward selected input devices. Switch bindings are
+  and either `device-whitelist` or ordered `device-groups` if you only want rkvm to grab and forward selected
+  input devices. The two input policies are mutually exclusive. Switch bindings are
   ordered: the last key is the activation trigger, so `["left-ctrl", "space"]` switches only when `space` is
   pressed while `left-ctrl` is already held. Prefer stable
   `/dev/input/by-id/*-event-kbd` or `/dev/input/by-path/*-event-kbd` symlinks in the whitelist instead of
   `/dev/input/eventN` paths, because event numbers can change between boots. Use
-  `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidate devices and whitelist matches; avoid
-  vendor/product-only rules unless you want every matching event node from that physical device or receiver.
-- Since rkvm-server grabs all input, i's a good idea to do a test run first to make sure you won't end up
-  being unable to user your keyboard and/or mouse because your display server is not properly configured to receive input from rkvm.
+  `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidate paths, aliases, source origin,
+  bus type, capabilities, and policy matches; avoid vendor/product-only rules unless you want every matching
+  event node from that physical device or receiver.
+- Since rkvm-server exclusively grabs every input selected by its policy, it is a good idea to do a test run
+  first to make sure your display server is properly configured to receive input from rkvm.
 
   Run the following command to start rkvm-server for 15 seconds to test that your keyboard, mouse, etc. works properly:
   ```
@@ -72,6 +74,25 @@ After installation:
   # systemctl enable rkvm-client
   # systemctl start rkvm-client
   ```
+
+## Input preprocessors and fallback devices
+
+rkvm continuously reconciles the evdev inventory. Devices that are temporarily busy, interrupted, or changing
+are retried with bounded backoff; hotplug removal affects only that routed device. This allows rkvm to coexist
+with exclusive-grab preprocessors such as interception-tools without relying on a service startup sleep.
+
+Use `device-groups` when one logical peripheral can appear as both a preferred processed virtual device and a
+physical fallback. Candidates are ordered by precedence, and at most one candidate in a group is active. A
+per-candidate `grab-delay-ms` gives a preprocessor time to claim the physical source and publish its virtual
+output. A present preferred candidate that is busy or deferred suppresses lower candidates. For input safety,
+rkvm does not replace an already active fallback when a preferred candidate appears later; the preferred device
+is selected after the active device disconnects or rkvm restarts.
+
+Candidate match fields are `path`, `name`, `vendor`, `product`, `version`, `origin`, and `bustype`. Fields in one
+candidate are ANDed. `origin` is derived from sysfs and is either `physical` or `virtual`; `bustype` is the source
+evdev bus ID, such as `0x0003` (`BUS_USB`) or `0x0006` (`BUS_VIRTUAL`). A uinput clone may preserve a physical
+bus type, so use `origin` and `bustype` together when necessary. See `example/server.toml` for a complete group
+example.
 
 ## Why rkvm and not Barrier/Synergy?
 The author of this program had a lot of problems with said programs, namely his keyboard layout (Czech) not being supported properly, which stems from the fact that the programs send characters which it then attempts to translate back into keycodes. rkvm takes a different approach to solving this problem and doesn't assume anything about your keyboard layout -- it sends raw keycodes only.
