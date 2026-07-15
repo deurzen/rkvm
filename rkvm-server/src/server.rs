@@ -3,7 +3,7 @@ use rkvm_input::abs::{AbsAxis, AbsInfo};
 use rkvm_input::event::Event;
 use rkvm_input::interceptor::Frame;
 use rkvm_input::key::{Key, KeyEvent};
-use rkvm_input::monitor::Monitor;
+use rkvm_input::monitor::{ActivationId, Monitor, MonitorEvent, ReleaseCause};
 use rkvm_input::rel::RelAxis;
 use rkvm_input::sync::SyncEvent;
 use rkvm_net::auth::{AuthChallenge, AuthResponse, AuthStatus};
@@ -21,6 +21,7 @@ use tokio::io::{AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
@@ -153,8 +154,34 @@ pub async fn run(
                     }
                 }
             }
-            result = monitor.read() => {
-                let mut interceptor = result.map_err(Error::Input)?;
+            result = monitor.read() => match result.map_err(Error::Input)? {
+                MonitorEvent::Remove { activation_id } => {
+                    let Some(id) = devices
+                        .iter()
+                        .find_map(|(id, device)| (device.activation_id == activation_id).then_some(id))
+                    else {
+                        tracing::debug!(activation_id, "Ignoring removal for stale input activation");
+                        continue;
+                    };
+
+                    if let Some(released) = destroy_device(
+                        &mut devices,
+                        &mut clients,
+                        id,
+                        &mut current,
+                        &mut previous,
+                        &mut active_binding,
+                        &mut pressed_keys,
+                    ).await {
+                        monitor
+                            .release(released, ReleaseCause::Disconnected)
+                            .await
+                            .map_err(Error::Input)?;
+                    }
+                }
+                MonitorEvent::Activated(activation) => {
+                let activation_id = activation.id();
+                let mut interceptor = activation.into_interceptor();
 
                 let name = interceptor.name().to_owned();
                 let id = devices.vacant_key();
@@ -191,7 +218,37 @@ pub async fn run(
                 }
 
                 let (interceptor_sender, mut interceptor_receiver) = mpsc::channel(32);
+                let events_sender = events_sender.clone();
+                let device_task = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            frame = interceptor.read_frame() => {
+                                let input_lost = matches!(frame, Ok(Frame::InputLost));
+                                let failed = frame.is_err();
+                                if events_sender.send((id, activation_id, frame)).await.is_err() || failed {
+                                    break;
+                                }
+                                if input_lost && !reset_local_device(id, activation_id, &mut interceptor, &mut interceptor_receiver, &events_sender).await {
+                                    break;
+                                }
+                            }
+                            command = interceptor_receiver.recv() => {
+                                let command = match command {
+                                    Some(command) => command,
+                                    None => break,
+                                };
+
+                                if !handle_device_command(id, activation_id, &mut interceptor, command, &events_sender).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
                 devices.insert(Device {
+                    activation_id,
+                    task: Some(device_task),
                     name,
                     version,
                     vendor,
@@ -204,34 +261,6 @@ pub async fn run(
                     sender: interceptor_sender,
                 });
 
-                let events_sender = events_sender.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            frame = interceptor.read_frame() => {
-                                let input_lost = matches!(frame, Ok(Frame::InputLost));
-                                let failed = frame.is_err();
-                                if events_sender.send((id, frame)).await.is_err() || failed {
-                                    break;
-                                }
-                                if input_lost && !reset_local_device(id, &mut interceptor, &mut interceptor_receiver, &events_sender).await {
-                                    break;
-                                }
-                            }
-                            command = interceptor_receiver.recv() => {
-                                let command = match command {
-                                    Some(command) => command,
-                                    None => break,
-                                };
-
-                                if !handle_device_command(id, &mut interceptor, command, &events_sender).await {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-
                 let device = &devices[id];
 
                 tracing::info!(
@@ -240,11 +269,22 @@ pub async fn run(
                     vendor = %device.vendor,
                     product = %device.product,
                     version = %device.version,
+                    activation_id,
                     "Registered new device"
                 );
-            }
-            (id, result) = event => match result {
+                }
+            },
+            (id, event_activation_id, result) = event => {
+                if !is_current_device_event(&devices, id, event_activation_id) {
+                    tracing::debug!(id, activation_id = event_activation_id, "Ignoring stale input task event");
+                    continue;
+                }
+
+                match result {
                 Ok(Frame::Events(events)) => {
+                    if !devices.contains(id) {
+                        continue;
+                    }
                     let mut routed = Vec::new();
 
                     for event in events {
@@ -381,7 +421,7 @@ pub async fn run(
 
                     let sender = devices[id].sender.clone();
                     if sender.send(DeviceCommand::Reset).await.is_err() {
-                        destroy_device(
+                        if let Some(released) = destroy_device(
                             &mut devices,
                             &mut clients,
                             id,
@@ -389,11 +429,22 @@ pub async fn run(
                             &mut previous,
                             &mut active_binding,
                             &mut pressed_keys,
-                        );
+                        ).await {
+                            monitor
+                                .release(released, ReleaseCause::Failed)
+                                .await
+                                .map_err(Error::Input)?;
+                        }
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::BrokenPipe => {
-                    destroy_device(
+                Err(err) => {
+                    let cause = if is_device_disconnect(&err) {
+                        ReleaseCause::Disconnected
+                    } else {
+                        tracing::error!(id = %id, error = %err, "Input device failed; other devices remain active");
+                        ReleaseCause::Failed
+                    };
+                    if let Some(released) = destroy_device(
                         &mut devices,
                         &mut clients,
                         id,
@@ -401,9 +452,14 @@ pub async fn run(
                         &mut previous,
                         &mut active_binding,
                         &mut pressed_keys,
-                    );
+                    ).await {
+                        monitor
+                            .release(released, cause)
+                            .await
+                            .map_err(Error::Input)?;
+                    }
                 }
-                Err(err) => return Err(Error::Input(err)),
+            }
             }
         }
     }
@@ -415,6 +471,8 @@ enum DeviceCommand {
 }
 
 struct Device {
+    activation_id: ActivationId,
+    task: Option<JoinHandle<()>>,
     name: CString,
     vendor: u16,
     product: u16,
@@ -434,9 +492,10 @@ struct AuthenticatedClient {
 
 async fn handle_device_command(
     id: usize,
+    activation_id: ActivationId,
     interceptor: &mut rkvm_input::interceptor::Interceptor,
     command: DeviceCommand,
-    events_sender: &Sender<(usize, Result<Frame, io::Error>)>,
+    events_sender: &Sender<(usize, ActivationId, Result<Frame, io::Error>)>,
 ) -> bool {
     let result = match command {
         DeviceCommand::Event(event) => interceptor.write(&event).await,
@@ -449,7 +508,7 @@ async fn handle_device_command(
             true
         }
         Err(err) => {
-            let _ = events_sender.send((id, Err(err))).await;
+            let _ = events_sender.send((id, activation_id, Err(err))).await;
             false
         }
     }
@@ -457,9 +516,10 @@ async fn handle_device_command(
 
 async fn reset_local_device(
     id: usize,
+    activation_id: ActivationId,
     interceptor: &mut rkvm_input::interceptor::Interceptor,
     interceptor_receiver: &mut Receiver<DeviceCommand>,
-    events_sender: &Sender<(usize, Result<Frame, io::Error>)>,
+    events_sender: &Sender<(usize, ActivationId, Result<Frame, io::Error>)>,
 ) -> bool {
     loop {
         let command = match interceptor_receiver.recv().await {
@@ -468,13 +528,19 @@ async fn reset_local_device(
         };
         let reset = matches!(command, DeviceCommand::Reset);
 
-        if !handle_device_command(id, interceptor, command, events_sender).await {
+        if !handle_device_command(id, activation_id, interceptor, command, events_sender).await {
             return false;
         }
         if reset {
             return true;
         }
     }
+}
+
+fn is_current_device_event(devices: &Slab<Device>, id: usize, activation_id: ActivationId) -> bool {
+    devices
+        .get(id)
+        .map_or(false, |device| device.activation_id == activation_id)
 }
 
 fn route_exists(clients: &Slab<(Sender<Update>, SocketAddr)>, idx: usize) -> bool {
@@ -516,7 +582,7 @@ fn reset_routing_state(
     pressed_keys.clear();
 }
 
-fn destroy_device(
+async fn destroy_device(
     devices: &mut Slab<Device>,
     clients: &mut Slab<(Sender<Update>, SocketAddr)>,
     id: usize,
@@ -524,19 +590,8 @@ fn destroy_device(
     previous: &mut usize,
     active_binding: &mut Option<HashSet<Key>>,
     pressed_keys: &mut HashMap<usize, HashSet<Key>>,
-) {
-    if devices.try_remove(id).is_none() {
-        return;
-    }
-
-    pressed_keys.remove(&id);
-    let pressed_key_union = pressed_key_union(pressed_keys);
-    if active_binding
-        .as_ref()
-        .map_or(false, |binding| binding.is_disjoint(&pressed_key_union))
-    {
-        *active_binding = None;
-    }
+) -> Option<ActivationId> {
+    let device = devices.try_remove(id)?;
 
     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
     for key in client_keys {
@@ -549,7 +604,30 @@ fn destroy_device(
         );
     }
 
-    tracing::info!(id = %id, "Destroyed device");
+    // The client lifecycle update must precede releasing the source grab. Stop
+    // and await the task next; dropping its future drops the Interceptor and
+    // both registry handles before reconciliation is allowed to reacquire it.
+    if let Some(task) = device.task {
+        task.abort();
+        let _ = task.await;
+    }
+
+    pressed_keys.remove(&id);
+    let pressed_key_union = pressed_key_union(pressed_keys);
+    if active_binding
+        .as_ref()
+        .map_or(false, |binding| binding.is_disjoint(&pressed_key_union))
+    {
+        *active_binding = None;
+    }
+
+    tracing::info!(id = %id, activation_id = device.activation_id, "Destroyed device");
+    Some(device.activation_id)
+}
+
+fn is_device_disconnect(err: &io::Error) -> bool {
+    err.kind() == ErrorKind::BrokenPipe
+        || matches!(err.raw_os_error(), Some(libc::ENODEV) | Some(libc::EIO))
 }
 
 fn reset_client_device(
@@ -860,6 +938,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_task_event_does_not_target_reused_device_id() {
+        let mut devices = Slab::new();
+        let mut first = test_device();
+        first.activation_id = 10;
+        let id = devices.insert(first);
+        assert!(is_current_device_event(&devices, id, 10));
+
+        devices.remove(id);
+        let mut replacement = test_device();
+        replacement.activation_id = 11;
+        assert_eq!(devices.insert(replacement), id);
+
+        assert!(!is_current_device_event(&devices, id, 10));
+        assert!(is_current_device_event(&devices, id, 11));
+    }
+
+    #[test]
     fn next_route_handles_sparse_client_keys() {
         let mut clients = Slab::new();
         let first = clients.insert(client_entry());
@@ -886,6 +981,8 @@ mod tests {
 
     fn test_device() -> Device {
         Device {
+            activation_id: 0,
+            task: None,
             name: CString::new("test").unwrap(),
             vendor: 1,
             product: 2,
@@ -928,8 +1025,8 @@ mod tests {
         assert!(pressed_keys.is_empty());
     }
 
-    #[test]
-    fn destroying_device_clears_only_its_switch_state() {
+    #[tokio::test]
+    async fn destroying_device_clears_only_its_switch_state() {
         let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
         let alt = Key::Key(rkvm_input::key::Keyboard::LeftAlt);
         let mut devices = Slab::new();
@@ -952,7 +1049,8 @@ mod tests {
             &mut previous,
             &mut active_binding,
             &mut pressed_keys,
-        );
+        )
+        .await;
 
         assert!(!devices.contains(removed));
         assert!(devices.contains(remaining));
@@ -966,8 +1064,8 @@ mod tests {
         assert_eq!(previous, 1);
     }
 
-    #[test]
-    fn destroying_device_preserves_binding_held_on_another_device() {
+    #[tokio::test]
+    async fn destroying_device_preserves_binding_held_on_another_device() {
         let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
         let mut devices = Slab::new();
         let removed = devices.insert(test_device());
@@ -989,7 +1087,8 @@ mod tests {
             &mut previous,
             &mut active_binding,
             &mut pressed_keys,
-        );
+        )
+        .await;
 
         assert!(active_binding.is_some());
         assert_eq!(

@@ -7,7 +7,7 @@ use crate::event::Event;
 use crate::glue::{self, input_absinfo};
 use crate::key::{Key, KeyEvent};
 use crate::rel::{RelAxis, RelEvent};
-use crate::uinput::Uinput;
+use crate::uinput::{CreateError, Uinput};
 
 use std::ffi::{CStr, OsStr};
 use std::io::Error;
@@ -98,7 +98,7 @@ impl Writer {
         Some(path)
     }
 
-    pub(crate) async fn from_evdev(evdev: &Evdev) -> Result<Self, Error> {
+    pub(crate) async fn from_evdev(evdev: &Evdev) -> Result<Self, CreateError> {
         Ok(Self {
             uinput: Uinput::from_evdev(evdev).await?,
         })
@@ -322,7 +322,11 @@ impl WriterBuilder {
     }
 
     pub async fn build(self) -> Result<Writer, Error> {
-        Writer::from_evdev(&self.evdev).await
+        Writer::from_evdev(&self.evdev)
+            .await
+            .map_err(|err| match err {
+                CreateError::Open(err) | CreateError::Create(err) => err,
+            })
     }
 }
 

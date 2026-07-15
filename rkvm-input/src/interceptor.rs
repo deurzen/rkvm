@@ -11,6 +11,7 @@ use crate::key::{Key, KeyEvent};
 use crate::registry::{Entry, Handle, Registry};
 use crate::rel::{RelAxis, RelEvent};
 use crate::sync::SyncEvent;
+use crate::uinput::CreateError;
 use crate::writer::Writer;
 
 use serde::Deserialize;
@@ -128,6 +129,25 @@ impl DeviceInfo {
 
     pub fn capabilities(&self) -> DeviceCapabilities {
         self.capabilities
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(path: &str) -> Self {
+        Self {
+            path: PathBuf::from(path),
+            sysfs_path: PathBuf::from("/sys/devices/virtual/input/input0/event0"),
+            origin: DeviceOrigin::Virtual,
+            name: CString::new("test device").unwrap(),
+            bustype: 0x0006,
+            vendor: 1,
+            product: 2,
+            version: 3,
+            capabilities: DeviceCapabilities {
+                key: true,
+                relative: false,
+                absolute: false,
+            },
+        }
     }
 }
 
@@ -336,7 +356,10 @@ impl Interceptor {
         self.writer.take();
         self.writer_handle.take();
 
-        let writer = Writer::from_evdev(&self.evdev).await?;
+        let _gate = self.registry.lock().await;
+        let writer = Writer::from_evdev(&self.evdev)
+            .await
+            .map_err(create_error_into_io)?;
         let path = writer
             .path()
             .ok_or_else(|| Error::new(ErrorKind::Other, "No syspath for writer"))?;
@@ -359,13 +382,20 @@ impl Interceptor {
                 match self.try_read_raw() {
                     Ok(event) => return Ok(event),
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) if err.raw_os_error() == Some(libc::EINTR) => continue,
                     Err(err) => return Err(err),
                 }
             }
 
-            let result = file.readable().await?.try_io(|_| self.try_read_raw());
+            let mut readable = match file.readable().await {
+                Ok(readable) => readable,
+                Err(err) if err.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(err) => return Err(err),
+            };
+            let result = readable.try_io(|_| self.try_read_raw());
 
             match result {
+                Ok(Err(err)) if err.raw_os_error() == Some(libc::EINTR) => continue,
                 Ok(result) => return result,
                 Err(_) => continue, // This means it would block.
             }
@@ -411,34 +441,39 @@ impl Interceptor {
     }
 
     #[tracing::instrument(skip(registry, device_filter))]
-    pub(crate) async fn open<F>(
+    pub(crate) async fn claim<F>(
         path: &Path,
+        expected: Entry,
         registry: &Registry,
         device_filter: &F,
-    ) -> Result<Self, OpenError>
+    ) -> Result<Self, ClaimError>
     where
         F: Fn(&DeviceInfo) -> bool + ?Sized,
     {
-        let evdev = Evdev::open(path).await?;
-        let info = DeviceInfo::from_evdev(path, &evdev).await?;
-
-        if !device_filter(&info) {
-            tracing::info!(
-                path = ?info.path(),
-                name = ?info.name(),
-                vendor = %info.vendor(),
-                product = %info.product(),
-                version = %info.version(),
-                "Ignored device because it is not whitelisted",
-            );
-            return Err(OpenError::NotAppliable);
+        let _gate = registry.lock().await;
+        if registry.contains(expected) {
+            return Err(ClaimError::Owned);
         }
 
-        let metadata = evdev.file().unwrap().get_ref().metadata()?;
+        let evdev = Evdev::open(path).await.map_err(ClaimError::source)?;
+        let metadata = evdev
+            .file()
+            .unwrap()
+            .get_ref()
+            .metadata()
+            .map_err(ClaimError::source)?;
+        if Entry::from_metadata(&metadata) != expected {
+            return Err(ClaimError::Stale);
+        }
 
-        let reader_handle = registry
-            .register(Entry::from_metadata(&metadata))
-            .ok_or(OpenError::NotAppliable)?;
+        let info = DeviceInfo::from_evdev(path, &evdev)
+            .await
+            .map_err(ClaimError::source)?;
+        if !device_filter(&info) {
+            return Err(ClaimError::NotApplicable);
+        }
+
+        let reader_handle = registry.register(expected).ok_or(ClaimError::Owned)?;
 
         // "Upon binding to a device or resuming from suspend, a driver must report
         // the current switch state. This ensures that the device, kernel, and userspace
@@ -446,7 +481,10 @@ impl Interceptor {
         // We have no way of knowing that.
         let sw = unsafe { glue::libevdev_has_event_type(evdev.as_ptr(), glue::EV_SW) };
         if sw == 1 {
-            return Err(OpenError::NotAppliable);
+            return Err(ClaimError::Unsupported(Error::new(
+                ErrorKind::Unsupported,
+                "switch devices cannot be reproduced safely",
+            )));
         }
 
         // Some buggy kernels can report nonsense abs info, so check for it and disable the axes.
@@ -474,7 +512,7 @@ impl Interceptor {
                     unsafe { glue::libevdev_disable_event_code(evdev.as_ptr(), glue::EV_ABS, i) };
 
                 if ret < 0 {
-                    return Err(Error::from_raw_os_error(-ret).into());
+                    return Err(ClaimError::source(Error::from_raw_os_error(-ret)));
                 }
             }
         }
@@ -487,29 +525,28 @@ impl Interceptor {
             unsafe { glue::libevdev_grab(evdev.as_ptr(), glue::libevdev_grab_mode_LIBEVDEV_GRAB) };
 
         if ret < 0 {
-            // We do not use ErrorKind::ResourceBusy because it is a nightly-only API.
-            let err = if ret == -libc::EBUSY {
-                tracing::info!(
-                    "Ignored {:?} because it is busy and can not be grabbed",
-                    path
-                );
-                OpenError::NotAppliable
+            let err = Error::from_raw_os_error(-ret);
+            return Err(if ret == -libc::EBUSY {
+                ClaimError::Busy
             } else {
-                Error::from_raw_os_error(-ret).into()
-            };
-
-            return Err(err);
+                ClaimError::source(err)
+            });
         }
 
-        let writer = Writer::from_evdev(&evdev).await?;
-        let path = writer
-            .path()
-            .ok_or_else(|| Error::new(ErrorKind::Other, "No syspath for writer"))?;
+        let writer = Writer::from_evdev(&evdev).await.map_err(|err| match err {
+            CreateError::Open(err) => ClaimError::Fatal(err),
+            CreateError::Create(err) => ClaimError::Output(err),
+        })?;
+        let path = writer.path().ok_or_else(|| {
+            ClaimError::Fatal(Error::new(ErrorKind::Other, "No devnode for writer"))
+        })?;
 
-        let metadata = fs::metadata(path)?;
+        let metadata = fs::metadata(path).map_err(ClaimError::Fatal)?;
         let writer_handle = registry
             .register(Entry::from_metadata(&metadata))
-            .ok_or_else(|| Error::new(ErrorKind::Other, "Writer already registered"))?;
+            .ok_or_else(|| {
+                ClaimError::Fatal(Error::new(ErrorKind::Other, "Writer already registered"))
+            })?;
 
         Ok(Self {
             evdev,
@@ -526,12 +563,48 @@ impl Interceptor {
 
 unsafe impl Send for Interceptor {}
 
+fn create_error_into_io(err: CreateError) -> Error {
+    match err {
+        CreateError::Open(err) | CreateError::Create(err) => err,
+    }
+}
+
 #[derive(Error, Debug)]
-pub(crate) enum OpenError {
-    #[error("Not appliable")]
-    NotAppliable,
-    #[error(transparent)]
-    Io(#[from] Error),
+pub(crate) enum ClaimError {
+    #[error("candidate is already owned by rkvm")]
+    Owned,
+    #[error("candidate node instance changed")]
+    Stale,
+    #[error("candidate no longer matches policy")]
+    NotApplicable,
+    #[error("candidate is busy")]
+    Busy,
+    #[error("candidate disappeared: {0}")]
+    Gone(Error),
+    #[error("candidate operation was interrupted: {0}")]
+    Interrupted(Error),
+    #[error("candidate access is blocked: {0}")]
+    Permission(Error),
+    #[error("candidate is unsupported: {0}")]
+    Unsupported(Error),
+    #[error("failed to create candidate output: {0}")]
+    Output(Error),
+    #[error("input infrastructure failed: {0}")]
+    Fatal(Error),
+    #[error("candidate operation failed: {0}")]
+    Other(Error),
+}
+
+impl ClaimError {
+    fn source(err: Error) -> Self {
+        match err.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ENODEV) => Self::Gone(err),
+            Some(libc::EINTR) => Self::Interrupted(err),
+            Some(libc::EACCES) | Some(libc::EPERM) => Self::Permission(err),
+            Some(libc::EINVAL) | Some(libc::ENOTTY) => Self::Unsupported(err),
+            _ => Self::Other(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -554,5 +627,29 @@ mod tests {
             DeviceOrigin::from_sysfs_path(Path::new("/sys/devices/virtual/misc/uinput")),
             DeviceOrigin::Physical
         );
+    }
+
+    #[test]
+    fn source_errors_have_retryable_dispositions() {
+        assert!(matches!(
+            ClaimError::source(Error::from_raw_os_error(libc::ENOENT)),
+            ClaimError::Gone(_)
+        ));
+        assert!(matches!(
+            ClaimError::source(Error::from_raw_os_error(libc::EINTR)),
+            ClaimError::Interrupted(_)
+        ));
+        assert!(matches!(
+            ClaimError::source(Error::from_raw_os_error(libc::EBUSY)),
+            ClaimError::Other(_)
+        ));
+        assert!(matches!(
+            ClaimError::source(Error::from_raw_os_error(libc::EACCES)),
+            ClaimError::Permission(_)
+        ));
+        assert!(matches!(
+            ClaimError::source(Error::from_raw_os_error(libc::ENOTTY)),
+            ClaimError::Unsupported(_)
+        ));
     }
 }

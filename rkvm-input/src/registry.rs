@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub struct Entry {
@@ -21,13 +22,23 @@ impl Entry {
 #[derive(Clone)]
 pub struct Registry {
     entries: Arc<Mutex<HashSet<Entry>>>,
+    gate: Arc<AsyncMutex<()>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashSet::new())),
+            gate: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    pub async fn lock(&self) -> AsyncMutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+
+    pub fn contains(&self, entry: Entry) -> bool {
+        self.entries.lock().unwrap().contains(&entry)
     }
 
     pub fn register(&self, entry: Entry) -> Option<Handle> {

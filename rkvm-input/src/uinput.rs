@@ -6,8 +6,17 @@ use std::io::Error;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
+use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::unix::AsyncFd;
+
+#[derive(Debug, Error)]
+pub(crate) enum CreateError {
+    #[error("failed to open /dev/uinput: {0}")]
+    Open(Error),
+    #[error("failed to create uinput device: {0}")]
+    Create(Error),
+}
 
 pub struct Uinput {
     file: AsyncFd<File>,
@@ -15,17 +24,18 @@ pub struct Uinput {
 }
 
 impl Uinput {
-    pub async fn from_evdev(evdev: &Evdev) -> Result<Self, Error> {
+    pub async fn from_evdev(evdev: &Evdev) -> Result<Self, CreateError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open("/dev/uinput")
-            .await?
+            .await
+            .map_err(CreateError::Open)?
             .into_std()
             .await;
 
-        let file = AsyncFd::new(file)?;
+        let file = AsyncFd::new(file).map_err(CreateError::Open)?;
 
         let mut uinput = MaybeUninit::uninit();
 
@@ -38,7 +48,7 @@ impl Uinput {
         };
 
         if ret < 0 {
-            return Err(Error::from_raw_os_error(-ret));
+            return Err(CreateError::Create(Error::from_raw_os_error(-ret)));
         }
 
         let uinput = unsafe { uinput.assume_init() };
