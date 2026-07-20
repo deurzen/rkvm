@@ -9,8 +9,10 @@ switch-bindings = [
     ["left-meta", "grave"],
     ["left-ctrl", "space"],
 ]
-# Whether switch key presses should be propagated on the server and its clients.
-# Optional, defaults to true.
+# Whether switch key presses should be propagated to the previously active
+# machine before its key state is released. Held modifiers other than the
+# trigger are then reasserted on the newly active machine. Optional, defaults
+# to true.
 # propagate-switch-keys = true
 
 # Per-client server queue size. If a client stops draining this queue, it is

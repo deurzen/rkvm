@@ -49,7 +49,10 @@ After installation:
   and either `device-whitelist` or ordered `device-groups` if you only want rkvm to grab and forward selected
   input devices. The two input policies are mutually exclusive. Switch bindings are
   ordered: the last key is the activation trigger, so `["left-ctrl", "space"]` switches only when `space` is
-  pressed while `left-ctrl` is already held. Prefer stable
+  pressed while `left-ctrl` is already held. At each switch, rkvm releases all keys on inactive outputs and
+  reasserts physically held Ctrl, Shift, Alt, and Meta modifiers on the new output. The trigger and other held
+  keys remain suppressed until released, preventing the switch chord or an unrelated held key from leaking to
+  the new machine. Prefer stable
   `/dev/input/by-id/*-event-kbd` or `/dev/input/by-path/*-event-kbd` symlinks in the whitelist instead of
   `/dev/input/eventN` paths, because event numbers can change between boots. Use
   `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidate paths, aliases, source origin,
