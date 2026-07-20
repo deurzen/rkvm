@@ -180,12 +180,16 @@ impl Router {
             if was_blocked {
                 if !down {
                     self.unblock_key(device_id, key);
+                    self.rearm_after_trigger_release(key);
                 }
                 self.clear_inactive_binding();
                 continue;
             }
 
             if consumed_by_active {
+                if !down {
+                    self.rearm_after_trigger_release(key);
+                }
                 self.clear_inactive_binding();
                 continue;
             }
@@ -262,6 +266,15 @@ impl Router {
                     .is_subset(&pressed)
                     .then_some(*index)
             })
+    }
+
+    fn rearm_after_trigger_release(&mut self, key: Key) {
+        if matches!(
+            self.active_binding,
+            Some(index) if self.bindings[index].trigger == key
+        ) {
+            self.active_binding = None;
+        }
     }
 
     fn clear_inactive_binding(&mut self) {
@@ -600,19 +613,42 @@ mod tests {
     }
 
     #[test]
-    fn trigger_does_not_leak_to_new_route_while_binding_is_active() {
+    fn released_trigger_rearms_while_binding_modifier_remains_held() {
         let mut router = router(true);
         let routes = [0, 1];
         router.add_device(1, HashSet::new(), &routes);
         router.process_frame(1, frame([key_event(Keyboard::LeftMeta, true)]), &routes);
         router.process_frame(1, frame([key_event(Keyboard::Grave, true)]), &routes);
 
-        for down in [false, true, false] {
-            let actions =
-                router.process_frame(1, frame([key_event(Keyboard::Grave, down)]), &routes);
-            assert!(routed_key_events(&actions, 1).is_empty());
-        }
+        let release = router.process_frame(1, frame([key_event(Keyboard::Grave, false)]), &routes);
+        assert!(routed_key_events(&release, 1).is_empty());
         assert_eq!(router.current(), 1);
+
+        for workspace in [Keyboard::N2, Keyboard::N3] {
+            let press = router.process_frame(1, frame([key_event(workspace, true)]), &routes);
+            assert_eq!(
+                routed_key_events(&press, 1),
+                vec![KeyEvent {
+                    key: key(workspace),
+                    down: true,
+                }]
+            );
+            router.process_frame(1, frame([key_event(workspace, false)]), &routes);
+        }
+
+        let retrigger = router.process_frame(1, frame([key_event(Keyboard::Grave, true)]), &routes);
+        assert_eq!(router.current(), 0);
+        assert_eq!(
+            routed_key_events(&retrigger, 1),
+            vec![KeyEvent {
+                key: key(Keyboard::Grave),
+                down: true,
+            }]
+        );
+        assert_eq!(
+            set_state(&retrigger, 0, 1).unwrap(),
+            &[key(Keyboard::LeftMeta)].into_iter().collect()
+        );
     }
 
     #[test]
