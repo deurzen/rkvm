@@ -1,4 +1,5 @@
 mod config;
+mod routing;
 mod server;
 mod tls;
 

@@ -1,13 +1,14 @@
 use crate::config::{DeviceGroup, DeviceMatch};
+pub(crate) use crate::routing::SwitchBinding;
+use crate::routing::{Action as RoutingAction, Router};
 use rkvm_input::abs::{AbsAxis, AbsInfo};
 use rkvm_input::event::Event;
 use rkvm_input::interceptor::Frame;
-use rkvm_input::key::{Key, KeyEvent};
+use rkvm_input::key::Key;
 use rkvm_input::monitor::{
     ActivationId, CandidatePolicy, GroupPolicy, Monitor, MonitorEvent, ReleaseCause,
 };
 use rkvm_input::rel::RelAxis;
-use rkvm_input::sync::SyncEvent;
 use rkvm_net::auth::{AuthChallenge, AuthResponse, AuthStatus};
 use rkvm_net::message::Message;
 use rkvm_net::version::Version;
@@ -38,18 +39,6 @@ pub enum Error {
     Input(io::Error),
     #[error("Event queue overflow")]
     Overflow,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SwitchBinding {
-    keys: HashSet<Key>,
-    trigger: Key,
-}
-
-impl SwitchBinding {
-    pub(crate) fn new(keys: HashSet<Key>, trigger: Key) -> Self {
-        Self { keys, trigger }
-    }
 }
 
 pub async fn run(
@@ -96,12 +85,7 @@ pub async fn run(
     };
     let mut devices = Slab::<Device>::new();
     let mut clients = Slab::<(Sender<_>, SocketAddr)>::new();
-    let mut current = 0;
-    let mut previous = 0;
-    let mut active_binding: Option<HashSet<Key>> = None;
-    let mut pressed_keys = HashMap::<usize, HashSet<Key>>::new();
-    let switch_keys = switch_key_set(switch_bindings);
-    let trigger_bindings = trigger_bindings(switch_bindings);
+    let mut router = Router::new(switch_bindings, propagate_switch_keys);
 
     let (events_sender, mut events_receiver) = mpsc::channel(1);
     let (authenticated_sender, mut authenticated_receiver) = mpsc::channel(32);
@@ -118,7 +102,8 @@ pub async fn run(
                 let password = password.to_owned();
                 let authenticated_sender = authenticated_sender.clone();
 
-                remove_dead_clients(&mut clients, &mut current, &mut previous);
+                remove_dead_clients(&mut clients);
+                stabilize_routes(&mut router, &devices, &mut clients)?;
 
                 let span = tracing::info_span!("connection", addr = %addr);
                 tokio::spawn(
@@ -158,7 +143,8 @@ pub async fn run(
                     )));
                 };
 
-                remove_dead_clients(&mut clients, &mut current, &mut previous);
+                remove_dead_clients(&mut clients);
+                stabilize_routes(&mut router, &devices, &mut clients)?;
 
                 let key = clients.insert((authenticated.sender, authenticated.addr));
                 tracing::info!(idx = %(key + 1), addr = %authenticated.addr, "Client authenticated");
@@ -169,16 +155,11 @@ pub async fn run(
                     .collect::<Vec<_>>();
 
                 for update in init_updates {
-                    if !try_send_update(
-                        &mut clients,
-                        key,
-                        update,
-                        &mut current,
-                        &mut previous,
-                    ) {
+                    if !try_send_update(&mut clients, key, update) {
                         break;
                     }
                 }
+                stabilize_routes(&mut router, &devices, &mut clients)?;
             }
             result = monitor.read() => match result.map_err(Error::Input)? {
                 MonitorEvent::Remove { activation_id } => {
@@ -193,12 +174,9 @@ pub async fn run(
                     if let Some(released) = destroy_device(
                         &mut devices,
                         &mut clients,
+                        &mut router,
                         id,
-                        &mut current,
-                        &mut previous,
-                        &mut active_binding,
-                        &mut pressed_keys,
-                    ).await {
+                    ).await? {
                         monitor
                             .release(released, ReleaseCause::Disconnected)
                             .await
@@ -217,6 +195,7 @@ pub async fn run(
                 let rel = interceptor.rel().collect::<HashSet<_>>();
                 let abs = interceptor.abs().collect::<HashMap<_,_>>();
                 let keys = interceptor.key().collect::<HashSet<_>>();
+                let pressed_keys = interceptor.pressed_keys();
                 let repeat = interceptor.repeat();
 
                 let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
@@ -234,13 +213,7 @@ pub async fn run(
                         period: repeat.period,
                     };
 
-                    try_send_update(
-                        &mut clients,
-                        key,
-                        update,
-                        &mut current,
-                        &mut previous,
-                    );
+                    try_send_update(&mut clients, key, update);
                 }
 
                 let (interceptor_sender, mut interceptor_receiver) = mpsc::channel(32);
@@ -287,6 +260,10 @@ pub async fn run(
                     sender: interceptor_sender,
                 });
 
+                let actions = router.add_device(id, pressed_keys, &available_routes(&clients));
+                dispatch_actions(actions, &devices, &mut clients)?;
+                stabilize_routes(&mut router, &devices, &mut clients)?;
+
                 let device = &devices[id];
 
                 tracing::info!(
@@ -311,138 +288,25 @@ pub async fn run(
                     if !devices.contains(id) {
                         continue;
                     }
-                    let mut routed = Vec::new();
 
-                    for event in events {
-                        let mut switch_key = false;
-
-                        let key_event = match &event {
-                            Event::Key(KeyEvent { key, down }) => Some((*key, *down)),
-                            _ => None,
-                        };
-
-                        if let Some((key, down)) = key_event {
-                            if switch_keys.contains(&key) {
-                                switch_key = true;
-
-                                let device_keys = pressed_keys.entry(id).or_default();
-                                match down {
-                                    true => device_keys.insert(key),
-                                    false => device_keys.remove(&key),
-                                };
-                                if device_keys.is_empty() {
-                                    pressed_keys.remove(&id);
-                                }
-                            }
-                        }
-
-                        // Who to send this event to.
-                        let mut idx = current;
-
-                        if let Some((key, down)) = key_event.filter(|(key, _)| switch_keys.contains(key)) {
-                            if let Some(binding) = &active_binding {
-                                if binding.contains(&key) {
-                                    idx = previous;
-                                }
-                            } else if down {
-                                let pressed_key_union = pressed_key_union(&pressed_keys);
-                                if let Some(binding) = matching_binding(
-                                    switch_bindings,
-                                    &trigger_bindings,
-                                    &pressed_key_union,
-                                    key,
-                                ) {
-                                    current = next_route(&clients, current);
-
-                                    previous = idx;
-                                    active_binding = Some(binding.keys.clone());
-
-                                    if current != 0 {
-                                        tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
-                                    } else {
-                                        tracing::info!(idx = %current, "Switched client");
-                                    }
-                                }
-                            }
-
-                            let pressed_key_union = pressed_key_union(&pressed_keys);
-                            if active_binding
-                                .as_ref()
-                                .map_or(false, |binding| binding.is_disjoint(&pressed_key_union))
-                            {
-                                active_binding = None;
-                            }
-                        }
-
-                        if switch_key && !propagate_switch_keys {
-                            continue;
-                        }
-
-                        routed.push((idx, event));
-                        if switch_key {
-                            routed.push((idx, Event::Sync(SyncEvent::All)));
-                        }
+                    let old_route = router.current();
+                    let actions = router.process_frame(id, events, &available_routes(&clients));
+                    if router.current() != old_route {
+                        log_route(&clients, router.current(), "Switched client");
                     }
-
-                    let mut routed = routed.into_iter().peekable();
-                    while let Some((idx, event)) = routed.next() {
-                        let mut events = vec![event];
-
-                        while matches!(routed.peek(), Some((next_idx, _)) if *next_idx == idx) {
-                            let (_, event) = routed.next().unwrap();
-                            events.push(event);
-                        }
-
-                        // Index 0 - special case to keep the modular arithmetic above working.
-                        if idx == 0 {
-                            // We do a try_send() here rather than a "blocking" send in order to prevent deadlocks.
-                            // In this scenario, the interceptor task is sending events to the main task,
-                            // while the main task is simultaneously sending events back to the interceptor.
-                            // This creates a classic deadlock situation where both tasks are waiting for each other.
-                            for event in events {
-                                match devices[id].sender.try_send(DeviceCommand::Event(event)) {
-                                    Ok(()) | Err(TrySendError::Closed(_)) => {},
-                                    Err(TrySendError::Full(_)) => return Err(Error::Overflow),
-                                }
-                            }
-
-                            continue;
-                        }
-
-                        if !route_exists(&clients, idx) {
-                            if current == idx {
-                                current = 0;
-                            }
-                            continue;
-                        }
-
-                        try_send_update(
-                            &mut clients,
-                            idx - 1,
-                            Update::Events { id, events },
-                            &mut current,
-                            &mut previous,
-                        );
-                    }
+                    dispatch_actions(actions, &devices, &mut clients)?;
+                    stabilize_routes(&mut router, &devices, &mut clients)?;
                 }
-                Ok(Frame::InputLost { .. }) => {
+                Ok(Frame::InputLost { pressed_keys }) => {
                     if !devices.contains(id) {
                         continue;
                     }
 
-                    tracing::warn!(id = %id, "Input device lost synchronization; resetting routed state");
-                    reset_routing_state(&mut current, &mut previous, &mut active_binding, &mut pressed_keys);
+                    tracing::warn!(id = %id, "Input device lost synchronization; reconciling physical state");
 
                     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
                     for key in client_keys {
-                        reset_client_device(
-                            &mut clients,
-                            key,
-                            id,
-                            &devices[id],
-                            &mut current,
-                            &mut previous,
-                        );
+                        reset_client_device(&mut clients, key, id, &devices[id]);
                     }
 
                     let sender = devices[id].sender.clone();
@@ -450,17 +314,22 @@ pub async fn run(
                         if let Some(released) = destroy_device(
                             &mut devices,
                             &mut clients,
+                            &mut router,
                             id,
-                            &mut current,
-                            &mut previous,
-                            &mut active_binding,
-                            &mut pressed_keys,
-                        ).await {
+                        ).await? {
                             monitor
                                 .release(released, ReleaseCause::Failed)
                                 .await
                                 .map_err(Error::Input)?;
                         }
+                    } else {
+                        let actions = router.reset_device(
+                            id,
+                            pressed_keys,
+                            &available_routes(&clients),
+                        );
+                        dispatch_actions(actions, &devices, &mut clients)?;
+                        stabilize_routes(&mut router, &devices, &mut clients)?;
                     }
                 }
                 Err(err) => {
@@ -473,12 +342,9 @@ pub async fn run(
                     if let Some(released) = destroy_device(
                         &mut devices,
                         &mut clients,
+                        &mut router,
                         id,
-                        &mut current,
-                        &mut previous,
-                        &mut active_binding,
-                        &mut pressed_keys,
-                    ).await {
+                    ).await? {
                         monitor
                             .release(released, cause)
                             .await
@@ -492,7 +358,8 @@ pub async fn run(
 }
 
 enum DeviceCommand {
-    Event(Event),
+    Events(Vec<Event>),
+    SetKeyState(HashSet<Key>),
     Reset,
 }
 
@@ -524,7 +391,8 @@ async fn handle_device_command(
     events_sender: &Sender<(usize, ActivationId, Result<Frame, io::Error>)>,
 ) -> bool {
     let result = match command {
-        DeviceCommand::Event(event) => interceptor.write(&event).await,
+        DeviceCommand::Events(events) => interceptor.write_frame(&events).await,
+        DeviceCommand::SetKeyState(pressed_keys) => interceptor.set_key_state(&pressed_keys).await,
         DeviceCommand::Reset => interceptor.reset_writer().await,
     };
 
@@ -569,16 +437,10 @@ fn is_current_device_event(devices: &Slab<Device>, id: usize, activation_id: Act
         .map_or(false, |device| device.activation_id == activation_id)
 }
 
-fn route_exists(clients: &Slab<(Sender<Update>, SocketAddr)>, idx: usize) -> bool {
-    idx == 0 || clients.contains(idx - 1)
-}
-
-fn next_route(clients: &Slab<(Sender<Update>, SocketAddr)>, current: usize) -> usize {
-    clients
-        .iter()
-        .map(|(key, _)| key + 1)
-        .find(|idx| *idx > current)
-        .unwrap_or(0)
+fn available_routes(clients: &Slab<(Sender<Update>, SocketAddr)>) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(clients.iter().map(|(key, _)| key + 1))
+        .collect()
 }
 
 fn create_device_update(id: usize, device: &Device) -> Update {
@@ -596,38 +458,110 @@ fn create_device_update(id: usize, device: &Device) -> Update {
     }
 }
 
-fn reset_routing_state(
-    current: &mut usize,
-    previous: &mut usize,
-    active_binding: &mut Option<HashSet<Key>>,
-    pressed_keys: &mut HashMap<usize, HashSet<Key>>,
-) {
-    *current = 0;
-    *previous = 0;
-    *active_binding = None;
-    pressed_keys.clear();
+fn dispatch_actions(
+    actions: Vec<RoutingAction>,
+    devices: &Slab<Device>,
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+) -> Result<(), Error> {
+    for action in actions {
+        let (route, device_id, local_command, remote_update) = match action {
+            RoutingAction::Events {
+                route,
+                device_id,
+                events,
+            } if route == 0 => (route, device_id, Some(DeviceCommand::Events(events)), None),
+            RoutingAction::Events {
+                route,
+                device_id,
+                events,
+            } => (
+                route,
+                device_id,
+                None,
+                Some(Update::Events {
+                    id: device_id,
+                    events,
+                }),
+            ),
+            RoutingAction::SetKeyState {
+                route,
+                device_id,
+                pressed_keys,
+            } if route == 0 => (
+                route,
+                device_id,
+                Some(DeviceCommand::SetKeyState(pressed_keys)),
+                None,
+            ),
+            RoutingAction::SetKeyState {
+                route,
+                device_id,
+                pressed_keys,
+            } => (
+                route,
+                device_id,
+                None,
+                Some(Update::SetKeyState {
+                    id: device_id,
+                    pressed_keys,
+                }),
+            ),
+        };
+
+        if let Some(command) = local_command {
+            let Some(device) = devices.get(device_id) else {
+                continue;
+            };
+            match device.sender.try_send(command) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(_)) => return Err(Error::Overflow),
+            }
+        } else {
+            try_send_update(clients, route - 1, remote_update.unwrap());
+        }
+    }
+    Ok(())
+}
+
+fn stabilize_routes(
+    router: &mut Router,
+    devices: &Slab<Device>,
+    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+) -> Result<(), Error> {
+    loop {
+        let old_route = router.current();
+        let actions = router.retain_routes(&available_routes(clients));
+        if actions.is_empty() {
+            return Ok(());
+        }
+        if router.current() != old_route {
+            log_route(clients, router.current(), "Recovered active route");
+        }
+        dispatch_actions(actions, devices, clients)?;
+    }
+}
+
+fn log_route(clients: &Slab<(Sender<Update>, SocketAddr)>, route: usize, message: &str) {
+    if route == 0 {
+        tracing::info!(idx = %route, "{}", message);
+    } else if let Some((_, addr)) = clients.get(route - 1) {
+        tracing::info!(idx = %route, addr = %addr, "{}", message);
+    }
 }
 
 async fn destroy_device(
     devices: &mut Slab<Device>,
     clients: &mut Slab<(Sender<Update>, SocketAddr)>,
+    router: &mut Router,
     id: usize,
-    current: &mut usize,
-    previous: &mut usize,
-    active_binding: &mut Option<HashSet<Key>>,
-    pressed_keys: &mut HashMap<usize, HashSet<Key>>,
-) -> Option<ActivationId> {
-    let device = devices.try_remove(id)?;
+) -> Result<Option<ActivationId>, Error> {
+    let Some(device) = devices.try_remove(id) else {
+        return Ok(None);
+    };
 
     let client_keys = clients.iter().map(|(key, _)| key).collect::<Vec<_>>();
     for key in client_keys {
-        try_send_update(
-            clients,
-            key,
-            Update::DestroyDevice { id },
-            current,
-            previous,
-        );
+        try_send_update(clients, key, Update::DestroyDevice { id });
     }
 
     // The client lifecycle update must precede releasing the source grab. Stop
@@ -638,17 +572,11 @@ async fn destroy_device(
         let _ = task.await;
     }
 
-    pressed_keys.remove(&id);
-    let pressed_key_union = pressed_key_union(pressed_keys);
-    if active_binding
-        .as_ref()
-        .map_or(false, |binding| binding.is_disjoint(&pressed_key_union))
-    {
-        *active_binding = None;
-    }
+    router.remove_device(id);
+    stabilize_routes(router, devices, clients)?;
 
     tracing::info!(id = %id, activation_id = device.activation_id, "Destroyed device");
-    Some(device.activation_id)
+    Ok(Some(device.activation_id))
 }
 
 fn is_device_disconnect(err: &io::Error) -> bool {
@@ -661,96 +589,26 @@ fn reset_client_device(
     key: usize,
     id: usize,
     device: &Device,
-    current: &mut usize,
-    previous: &mut usize,
 ) -> bool {
-    try_send_update(
-        clients,
-        key,
-        Update::DestroyDevice { id },
-        current,
-        previous,
-    ) && try_send_update(
-        clients,
-        key,
-        create_device_update(id, device),
-        current,
-        previous,
-    )
+    try_send_update(clients, key, Update::DestroyDevice { id })
+        && try_send_update(clients, key, create_device_update(id, device))
 }
 
-fn pressed_key_union(pressed_keys: &HashMap<usize, HashSet<Key>>) -> HashSet<Key> {
-    pressed_keys
-        .values()
-        .flat_map(|keys| keys.iter())
-        .copied()
-        .collect()
-}
-
-fn switch_key_set(bindings: &[SwitchBinding]) -> HashSet<Key> {
-    bindings
-        .iter()
-        .flat_map(|binding| binding.keys.iter())
-        .copied()
-        .collect()
-}
-
-fn trigger_bindings(bindings: &[SwitchBinding]) -> HashMap<Key, Vec<usize>> {
-    let mut triggers = HashMap::<Key, Vec<usize>>::new();
-    for (idx, binding) in bindings.iter().enumerate() {
-        triggers.entry(binding.trigger).or_default().push(idx);
-    }
-    triggers
-}
-
-fn matching_binding<'a>(
-    bindings: &'a [SwitchBinding],
-    trigger_bindings: &HashMap<Key, Vec<usize>>,
-    pressed_keys: &HashSet<Key>,
-    key: Key,
-) -> Option<&'a SwitchBinding> {
-    trigger_bindings.get(&key)?.iter().find_map(|idx| {
-        let binding = &bindings[*idx];
-        binding.keys.is_subset(pressed_keys).then_some(binding)
-    })
-}
-
-fn remove_client(
-    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
-    key: usize,
-    current: &mut usize,
-    previous: &mut usize,
-    reason: &str,
-) {
+fn remove_client(clients: &mut Slab<(Sender<Update>, SocketAddr)>, key: usize, reason: &str) {
     let Some((_, addr)) = clients.try_remove(key) else {
         return;
     };
 
-    let idx = key + 1;
-    if *current == idx {
-        *current = 0;
-    }
-    if *previous == idx {
-        *previous = 0;
-    }
-
-    tracing::warn!(idx = %idx, addr = %addr, reason = %reason, "Disconnected client");
+    tracing::warn!(idx = %(key + 1), addr = %addr, reason = %reason, "Disconnected client");
 }
 
-fn remove_dead_clients(
-    clients: &mut Slab<(Sender<Update>, SocketAddr)>,
-    current: &mut usize,
-    previous: &mut usize,
-) {
+fn remove_dead_clients(clients: &mut Slab<(Sender<Update>, SocketAddr)>) {
     let closed_clients = clients
         .iter()
         .filter_map(|(key, (client, _))| client.is_closed().then_some(key))
         .collect::<Vec<_>>();
     for key in closed_clients {
-        remove_client(clients, key, current, previous, "closed channel");
-    }
-    if !route_exists(clients, *current) {
-        *current = 0;
+        remove_client(clients, key, "closed channel");
     }
 }
 
@@ -758,8 +616,6 @@ fn try_send_update(
     clients: &mut Slab<(Sender<Update>, SocketAddr)>,
     key: usize,
     update: Update,
-    current: &mut usize,
-    previous: &mut usize,
 ) -> bool {
     let result = match clients.get(key) {
         Some((sender, _)) => sender.try_send(update),
@@ -769,11 +625,11 @@ fn try_send_update(
     match result {
         Ok(()) => true,
         Err(TrySendError::Closed(_)) => {
-            remove_client(clients, key, current, previous, "closed channel");
+            remove_client(clients, key, "closed channel");
             false
         }
         Err(TrySendError::Full(_)) => {
-            remove_client(clients, key, current, previous, "queue overflow");
+            remove_client(clients, key, "queue overflow");
             false
         }
     }
@@ -963,48 +819,6 @@ mod tests {
         (sender, "127.0.0.1:1234".parse().unwrap())
     }
 
-    #[test]
-    fn stale_task_event_does_not_target_reused_device_id() {
-        let mut devices = Slab::new();
-        let mut first = test_device();
-        first.activation_id = 10;
-        let id = devices.insert(first);
-        assert!(is_current_device_event(&devices, id, 10));
-
-        devices.remove(id);
-        let mut replacement = test_device();
-        replacement.activation_id = 11;
-        assert_eq!(devices.insert(replacement), id);
-
-        assert!(!is_current_device_event(&devices, id, 10));
-        assert!(is_current_device_event(&devices, id, 11));
-    }
-
-    #[test]
-    fn next_route_handles_sparse_client_keys() {
-        let mut clients = Slab::new();
-        let first = clients.insert(client_entry());
-        let second = clients.insert(client_entry());
-        clients.remove(first);
-
-        assert_eq!(next_route(&clients, 0), second + 1);
-        assert_eq!(next_route(&clients, second + 1), 0);
-    }
-
-    #[test]
-    fn remove_client_resets_active_routes() {
-        let mut clients = Slab::new();
-        let key = clients.insert(client_entry());
-        let mut current = key + 1;
-        let mut previous = key + 1;
-
-        remove_client(&mut clients, key, &mut current, &mut previous, "test");
-
-        assert_eq!(current, 0);
-        assert_eq!(previous, 0);
-        assert!(!route_exists(&clients, key + 1));
-    }
-
     fn test_device() -> Device {
         Device {
             activation_id: 0,
@@ -1023,118 +837,42 @@ mod tests {
     }
 
     #[test]
-    fn reset_routing_state_routes_local_and_clears_switch_state() {
-        let mut current = 2;
-        let mut previous = 1;
-        let mut active_binding = Some(
-            [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
-                .into_iter()
-                .collect(),
-        );
-        let mut pressed_keys = HashMap::from([(
-            7,
-            [Key::Key(rkvm_input::key::Keyboard::LeftCtrl)]
-                .into_iter()
-                .collect(),
-        )]);
-
-        reset_routing_state(
-            &mut current,
-            &mut previous,
-            &mut active_binding,
-            &mut pressed_keys,
-        );
-
-        assert_eq!(current, 0);
-        assert_eq!(previous, 0);
-        assert!(active_binding.is_none());
-        assert!(pressed_keys.is_empty());
-    }
-
-    #[tokio::test]
-    async fn destroying_device_clears_only_its_switch_state() {
-        let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
-        let alt = Key::Key(rkvm_input::key::Keyboard::LeftAlt);
+    fn stale_task_event_does_not_target_reused_device_id() {
         let mut devices = Slab::new();
-        let removed = devices.insert(test_device());
-        let remaining = devices.insert(test_device());
-        let mut clients = Slab::new();
-        let mut current = 2;
-        let mut previous = 1;
-        let mut active_binding = Some([ctrl].into_iter().collect());
-        let mut pressed_keys = HashMap::from([
-            (removed, [ctrl].into_iter().collect()),
-            (remaining, [alt].into_iter().collect()),
-        ]);
+        let mut first = test_device();
+        first.activation_id = 10;
+        let id = devices.insert(first);
+        assert!(is_current_device_event(&devices, id, 10));
 
-        destroy_device(
-            &mut devices,
-            &mut clients,
-            removed,
-            &mut current,
-            &mut previous,
-            &mut active_binding,
-            &mut pressed_keys,
-        )
-        .await;
+        devices.remove(id);
+        let mut replacement = test_device();
+        replacement.activation_id = 11;
+        assert_eq!(devices.insert(replacement), id);
 
-        assert!(!devices.contains(removed));
-        assert!(devices.contains(remaining));
-        assert!(!pressed_keys.contains_key(&removed));
-        assert_eq!(
-            pressed_key_union(&pressed_keys),
-            [alt].into_iter().collect()
-        );
-        assert!(active_binding.is_none());
-        assert_eq!(current, 2);
-        assert_eq!(previous, 1);
-    }
-
-    #[tokio::test]
-    async fn destroying_device_preserves_binding_held_on_another_device() {
-        let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
-        let mut devices = Slab::new();
-        let removed = devices.insert(test_device());
-        let remaining = devices.insert(test_device());
-        let mut clients = Slab::new();
-        let mut current = 0;
-        let mut previous = 0;
-        let mut active_binding = Some([ctrl].into_iter().collect());
-        let mut pressed_keys = HashMap::from([
-            (removed, [ctrl].into_iter().collect()),
-            (remaining, [ctrl].into_iter().collect()),
-        ]);
-
-        destroy_device(
-            &mut devices,
-            &mut clients,
-            removed,
-            &mut current,
-            &mut previous,
-            &mut active_binding,
-            &mut pressed_keys,
-        )
-        .await;
-
-        assert!(active_binding.is_some());
-        assert_eq!(
-            pressed_key_union(&pressed_keys),
-            [ctrl].into_iter().collect()
-        );
+        assert!(!is_current_device_event(&devices, id, 10));
+        assert!(is_current_device_event(&devices, id, 11));
     }
 
     #[test]
-    fn local_reset_command_is_ordered_after_queued_events() {
+    fn available_routes_preserve_sparse_client_ids() {
+        let mut clients = Slab::new();
+        let first = clients.insert(client_entry());
+        let second = clients.insert(client_entry());
+        clients.remove(first);
+
+        assert_eq!(available_routes(&clients), vec![0, second + 1]);
+    }
+
+    #[test]
+    fn local_reset_command_is_ordered_after_queued_frames() {
         let (sender, mut receiver) = mpsc::channel(2);
 
-        sender
-            .try_send(DeviceCommand::Event(Event::Sync(SyncEvent::All)))
-            .unwrap();
+        sender.try_send(DeviceCommand::Events(Vec::new())).unwrap();
         sender.try_send(DeviceCommand::Reset).unwrap();
 
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            DeviceCommand::Event(Event::Sync(SyncEvent::All))
+            DeviceCommand::Events(events) if events.is_empty()
         ));
         assert!(matches!(receiver.try_recv().unwrap(), DeviceCommand::Reset));
     }
@@ -1144,141 +882,39 @@ mod tests {
         let mut clients = Slab::new();
         let (sender, mut receiver) = mpsc::channel(1);
         let key = clients.insert((sender, "127.0.0.1:1234".parse().unwrap()));
-        let mut current = key + 1;
-        let mut previous = key + 1;
         let device = test_device();
 
-        assert!(!reset_client_device(
-            &mut clients,
-            key,
-            7,
-            &device,
-            &mut current,
-            &mut previous,
-        ));
+        assert!(!reset_client_device(&mut clients, key, 7, &device));
         assert!(!clients.contains(key));
-        assert_eq!(current, 0);
-        assert_eq!(previous, 0);
-
         assert!(matches!(
             receiver.try_recv().unwrap(),
             Update::DestroyDevice { id: 7 }
         ));
     }
 
-    fn key(key: rkvm_input::key::Keyboard) -> Key {
-        Key::Key(key)
-    }
-
-    fn switch_binding(keys: &[Key], trigger: Key) -> SwitchBinding {
-        SwitchBinding::new(keys.iter().copied().collect(), trigger)
-    }
-
     #[test]
-    fn switch_key_set_contains_union_of_bindings() {
-        let bindings = vec![
-            switch_binding(
-                &[
-                    key(rkvm_input::key::Keyboard::LeftCtrl),
-                    key(rkvm_input::key::Keyboard::Space),
-                ],
-                key(rkvm_input::key::Keyboard::Space),
-            ),
-            switch_binding(
-                &[key(rkvm_input::key::Keyboard::LeftAlt)],
-                key(rkvm_input::key::Keyboard::LeftAlt),
-            ),
-        ];
+    fn dispatches_local_reconciliation_as_one_command() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut devices = Slab::new();
+        let mut device = test_device();
+        device.sender = sender;
+        let id = devices.insert(device);
+        let ctrl = Key::Key(rkvm_input::key::Keyboard::LeftCtrl);
 
-        let keys = switch_key_set(&bindings);
-
-        assert!(keys.contains(&key(rkvm_input::key::Keyboard::LeftCtrl)));
-        assert!(keys.contains(&key(rkvm_input::key::Keyboard::Space)));
-        assert!(keys.contains(&key(rkvm_input::key::Keyboard::LeftAlt)));
-        assert!(!keys.contains(&key(rkvm_input::key::Keyboard::A)));
-    }
-
-    #[test]
-    fn matching_binding_requires_complete_chord_and_trigger_key() {
-        let bindings = vec![switch_binding(
-            &[
-                key(rkvm_input::key::Keyboard::LeftCtrl),
-                key(rkvm_input::key::Keyboard::Space),
-            ],
-            key(rkvm_input::key::Keyboard::Space),
-        )];
-        let triggers = trigger_bindings(&bindings);
-        let partial = [key(rkvm_input::key::Keyboard::LeftCtrl)]
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let complete = [
-            key(rkvm_input::key::Keyboard::LeftCtrl),
-            key(rkvm_input::key::Keyboard::Space),
-        ]
-        .into_iter()
-        .collect::<HashSet<_>>();
-
-        assert!(matching_binding(
-            &bindings,
-            &triggers,
-            &partial,
-            key(rkvm_input::key::Keyboard::Space),
-        )
-        .is_none());
-        assert!(matching_binding(
-            &bindings,
-            &triggers,
-            &complete,
-            key(rkvm_input::key::Keyboard::LeftCtrl),
-        )
-        .is_none());
-        assert!(matching_binding(
-            &bindings,
-            &triggers,
-            &complete,
-            key(rkvm_input::key::Keyboard::Space),
-        )
-        .is_some());
-    }
-
-    #[test]
-    fn matching_binding_uses_config_order_for_shared_triggers() {
-        let bindings = vec![
-            switch_binding(
-                &[
-                    key(rkvm_input::key::Keyboard::LeftCtrl),
-                    key(rkvm_input::key::Keyboard::Space),
-                ],
-                key(rkvm_input::key::Keyboard::Space),
-            ),
-            switch_binding(
-                &[
-                    key(rkvm_input::key::Keyboard::LeftAlt),
-                    key(rkvm_input::key::Keyboard::Space),
-                ],
-                key(rkvm_input::key::Keyboard::Space),
-            ),
-        ];
-        let triggers = trigger_bindings(&bindings);
-        let pressed = [
-            key(rkvm_input::key::Keyboard::LeftCtrl),
-            key(rkvm_input::key::Keyboard::LeftAlt),
-            key(rkvm_input::key::Keyboard::Space),
-        ]
-        .into_iter()
-        .collect::<HashSet<_>>();
-
-        let matched = matching_binding(
-            &bindings,
-            &triggers,
-            &pressed,
-            key(rkvm_input::key::Keyboard::Space),
+        dispatch_actions(
+            vec![RoutingAction::SetKeyState {
+                route: 0,
+                device_id: id,
+                pressed_keys: [ctrl].into_iter().collect(),
+            }],
+            &devices,
+            &mut Slab::new(),
         )
         .unwrap();
 
-        assert_eq!(matched.trigger, key(rkvm_input::key::Keyboard::Space));
-        assert!(matched
-            .keys
-            .contains(&key(rkvm_input::key::Keyboard::LeftCtrl)));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            DeviceCommand::SetKeyState(keys) if keys == [ctrl].into_iter().collect()
+        ));
     }
 }

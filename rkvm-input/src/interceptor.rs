@@ -296,6 +296,14 @@ impl Interceptor {
         self.writer_mut()?.write(event).await
     }
 
+    pub async fn write_frame(&mut self, events: &[Event]) -> Result<(), Error> {
+        self.writer_mut()?.write_frame(events).await
+    }
+
+    pub async fn set_key_state(&mut self, pressed_keys: &HashSet<Key>) -> Result<(), Error> {
+        self.writer_mut()?.set_key_state(pressed_keys).await
+    }
+
     pub fn name(&self) -> &CStr {
         let name = unsafe { glue::libevdev_get_name(self.evdev.as_ptr()) };
         let name = unsafe { CStr::from_ptr(name) };
