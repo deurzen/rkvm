@@ -101,13 +101,36 @@ impl Router {
         routes: &[Route],
     ) -> Vec<Action> {
         self.active_binding = None;
-        let actions = self.add_device(device_id, pressed_keys, routes);
+        self.physical_keys.insert(device_id, pressed_keys);
+
         let pressed = self.pressed_key_union();
         self.active_binding = self
             .bindings
             .iter()
             .position(|binding| binding.keys.is_subset(&pressed));
-        actions
+
+        let blocked = self
+            .physical_keys
+            .get(&device_id)
+            .into_iter()
+            .flatten()
+            .filter(|key| match self.active_binding {
+                Some(index) => {
+                    !key.is_modifier()
+                        || **key == self.bindings[index].trigger
+                        || (!self.propagate_switch_keys && self.switch_keys.contains(key))
+                }
+                None => self.trigger_keys.contains(key),
+            })
+            .copied()
+            .collect::<HashSet<_>>();
+        if blocked.is_empty() {
+            self.blocked_keys.remove(&device_id);
+        } else {
+            self.blocked_keys.insert(device_id, blocked);
+        }
+
+        self.reconcile_device(device_id, routes, ReconcileMode::Recovery)
     }
 
     pub(crate) fn remove_device(&mut self, device_id: usize) {
@@ -143,10 +166,10 @@ impl Router {
                 continue;
             };
 
-            let was_blocked = self
-                .blocked_keys
-                .get(&device_id)
-                .map_or(false, |keys| keys.contains(&key));
+            let was_blocked = matches!(
+                self.blocked_keys.get(&device_id),
+                Some(keys) if keys.contains(&key)
+            );
             self.update_physical_key(device_id, key, down);
 
             let consumed_by_active = self
@@ -369,7 +392,7 @@ impl Router {
             .iter()
             .filter(|key| {
                 (mode == ReconcileMode::Recovery || key.is_modifier())
-                    && !blocked.map_or(false, |keys| keys.contains(key))
+                    && !matches!(blocked, Some(keys) if keys.contains(key))
             })
             .copied()
             .collect()
@@ -646,6 +669,21 @@ mod tests {
 
         assert_eq!(router.current(), 0);
         assert!(set_state(&actions, 0, 8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_keeps_complete_switch_gesture_consumed() {
+        let mut router = Router::new(&[binding(&[Keyboard::A, Keyboard::B], Keyboard::B)], true);
+        router.add_device(5, HashSet::new(), &[0]);
+
+        let pressed = [key(Keyboard::A), key(Keyboard::B)].into_iter().collect();
+        let actions = router.reset_device(5, pressed, &[0]);
+
+        assert!(set_state(&actions, 0, 5).unwrap().is_empty());
+        for keyboard in [Keyboard::B, Keyboard::A] {
+            let release = router.process_frame(5, frame([key_event(keyboard, false)]), &[0]);
+            assert!(routed_key_events(&release, 0).is_empty());
+        }
     }
 
     #[test]
