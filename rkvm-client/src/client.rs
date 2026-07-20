@@ -244,6 +244,21 @@ async fn run_once(
 
                 tracing::trace!(id = %id, count = %count, "Wrote events to device");
             }
+            Update::SetKeyState { id, pressed_keys } => {
+                let writer = writers.get_mut(&id).ok_or_else(|| {
+                    Error::Network(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Server set key state on a nonexistent device",
+                    ))
+                })?;
+
+                writer
+                    .set_key_state(&pressed_keys)
+                    .await
+                    .map_err(Error::Input)?;
+
+                tracing::debug!(id = %id, pressed = %pressed_keys.len(), "Reconciled device key state");
+            }
             Update::Ping => {
                 let duration = start.elapsed();
                 tracing::debug!(duration = ?duration, "Received ping");

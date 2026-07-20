@@ -53,6 +53,10 @@ pub enum Update {
         id: usize,
         events: Vec<Event>,
     },
+    SetKeyState {
+        id: usize,
+        pressed_keys: HashSet<Key>,
+    },
     Ping,
 }
 
@@ -105,6 +109,32 @@ mod test {
                     events[1],
                     Event::Sync(rkvm_input::sync::SyncEvent::All)
                 ));
+            }
+            _ => panic!("unexpected update"),
+        }
+    }
+
+    #[tokio::test]
+    async fn key_state_round_trips() {
+        let update = Update::SetKeyState {
+            id: 3,
+            pressed_keys: [Key::Key(rkvm_input::key::Keyboard::LeftMeta)]
+                .into_iter()
+                .collect(),
+        };
+        let mut data = Vec::new();
+        update.encode(&mut data).await.unwrap();
+
+        let decoded = Update::decode(&mut data.as_slice()).await.unwrap();
+        match decoded {
+            Update::SetKeyState { id, pressed_keys } => {
+                assert_eq!(id, 3);
+                assert_eq!(
+                    pressed_keys,
+                    [Key::Key(rkvm_input::key::Keyboard::LeftMeta)]
+                        .into_iter()
+                        .collect()
+                );
             }
             _ => panic!("unexpected update"),
         }
