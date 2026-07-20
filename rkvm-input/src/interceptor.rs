@@ -15,7 +15,7 @@ use crate::uinput::CreateError;
 use crate::writer::Writer;
 
 use serde::Deserialize;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Error, ErrorKind};
@@ -178,12 +178,12 @@ fn recovery_error(err: Error) -> Error {
 
 pub enum Frame {
     Events(Vec<Event>),
-    InputLost,
+    InputLost { pressed_keys: HashSet<Key> },
 }
 
 enum Read {
     Event(Event),
-    InputLost,
+    InputLost { pressed_keys: HashSet<Key> },
 }
 
 enum RawRead {
@@ -222,7 +222,9 @@ impl Interceptor {
                 RawRead::Event(r#type, code, value) => (r#type, code, value),
                 RawRead::InputLost => {
                     self.recover_input_loss().await?;
-                    return Ok(Read::InputLost);
+                    return Ok(Read::InputLost {
+                        pressed_keys: self.pressed_keys(),
+                    });
                 }
             };
 
@@ -243,11 +245,16 @@ impl Interceptor {
                         down: value == 1,
                     })
                 }),
+                // The cloned uinput device generates repeats from EV_REP itself.
+                // Echoing source repeat events would also bypass server routing.
+                glue::EV_KEY if value == 2 => continue,
                 glue::EV_SYN => match code as _ {
                     glue::SYN_REPORT => Some(Event::Sync(SyncEvent::All)),
                     glue::SYN_DROPPED => {
                         self.recover_input_loss().await?;
-                        return Ok(Read::InputLost);
+                        return Ok(Read::InputLost {
+                            pressed_keys: self.pressed_keys(),
+                        });
                     }
                     glue::SYN_MT_REPORT => Some(Event::Sync(SyncEvent::Mt)),
                     _ => continue,
@@ -274,7 +281,7 @@ impl Interceptor {
         loop {
             let event = match self.read().await? {
                 Read::Event(event) => event,
-                Read::InputLost => return Ok(Frame::InputLost),
+                Read::InputLost { pressed_keys } => return Ok(Frame::InputLost { pressed_keys }),
             };
             let is_frame_end = matches!(&event, Event::Sync(SyncEvent::All));
             events.push(event);
@@ -318,6 +325,20 @@ impl Interceptor {
 
     pub fn key(&self) -> KeyCaps {
         KeyCaps::new(self)
+    }
+
+    pub fn pressed_keys(&self) -> HashSet<Key> {
+        self.key()
+            .filter(|key| {
+                let Some(code) = key.to_raw() else {
+                    return false;
+                };
+                unsafe {
+                    glue::libevdev_get_event_value(self.evdev.as_ptr(), glue::EV_KEY, code as _)
+                        != 0
+                }
+            })
+            .collect()
     }
 
     pub fn repeat(&self) -> Repeat {

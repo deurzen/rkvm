@@ -249,7 +249,7 @@ pub async fn run(
                     loop {
                         tokio::select! {
                             frame = interceptor.read_frame() => {
-                                let input_lost = matches!(frame, Ok(Frame::InputLost));
+                                let input_lost = matches!(frame, Ok(Frame::InputLost { .. }));
                                 let failed = frame.is_err();
                                 if events_sender.send((id, activation_id, frame)).await.is_err() || failed {
                                     break;
@@ -425,7 +425,7 @@ pub async fn run(
                         );
                     }
                 }
-                Ok(Frame::InputLost) => {
+                Ok(Frame::InputLost { .. }) => {
                     if !devices.contains(id) {
                         continue;
                     }

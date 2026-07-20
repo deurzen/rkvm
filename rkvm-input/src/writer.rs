@@ -9,6 +9,7 @@ use crate::key::{Key, KeyEvent};
 use crate::rel::{RelAxis, RelEvent};
 use crate::uinput::{CreateError, Uinput};
 
+use std::collections::HashSet;
 use std::ffi::{CStr, OsStr};
 use std::io::Error;
 use std::os::unix::ffi::OsStrExt;
@@ -17,6 +18,7 @@ use std::ptr;
 
 pub struct Writer {
     uinput: Uinput,
+    pressed_keys: HashSet<Key>,
 }
 
 fn raw_event(event: &Event) -> Option<(u16, u16, i32)> {
@@ -45,18 +47,19 @@ impl Writer {
     pub async fn write(&mut self, event: &Event) -> Result<(), Error> {
         if let Some((r#type, code, value)) = raw_event(event) {
             self.write_raw(r#type, code, value).await?;
+            self.update_key_state(event);
         }
 
         Ok(())
     }
 
     pub async fn write_frame(&mut self, events: &[Event]) -> Result<(), Error> {
-        let events = events.iter().filter_map(raw_event).collect::<Vec<_>>();
+        let raw_events = events.iter().filter_map(raw_event).collect::<Vec<_>>();
         let mut cursor = 0;
 
-        while cursor < events.len() {
+        while cursor < raw_events.len() {
             let result = self.uinput.file().writable().await?.try_io(|_| {
-                while let Some((r#type, code, value)) = events.get(cursor).copied() {
+                while let Some((r#type, code, value)) = raw_events.get(cursor).copied() {
                     let ret = unsafe {
                         glue::libevdev_uinput_write_event(
                             self.uinput.as_ptr(),
@@ -77,12 +80,40 @@ impl Writer {
             });
 
             match result {
-                Ok(result) => return result,
+                Ok(result) => result?,
                 Err(_) => continue, // This means it would block.
             }
         }
 
+        for event in events {
+            self.update_key_state(event);
+        }
         Ok(())
+    }
+
+    pub async fn set_key_state(&mut self, pressed_keys: &HashSet<Key>) -> Result<(), Error> {
+        let events = key_state_events(&self.pressed_keys, pressed_keys);
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        self.write_frame(&events).await
+    }
+
+    pub fn pressed_keys(&self) -> &HashSet<Key> {
+        &self.pressed_keys
+    }
+
+    fn update_key_state(&mut self, event: &Event) {
+        let Event::Key(KeyEvent { key, down }) = event else {
+            return;
+        };
+
+        if *down {
+            self.pressed_keys.insert(*key);
+        } else {
+            self.pressed_keys.remove(key);
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -101,6 +132,7 @@ impl Writer {
     pub(crate) async fn from_evdev(evdev: &Evdev) -> Result<Self, CreateError> {
         Ok(Self {
             uinput: Uinput::from_evdev(evdev).await?,
+            pressed_keys: HashSet::new(),
         })
     }
 
@@ -134,6 +166,28 @@ impl Writer {
             }
         }
     }
+}
+
+fn key_state_events(current: &HashSet<Key>, desired: &HashSet<Key>) -> Vec<Event> {
+    let mut released = current.difference(desired).copied().collect::<Vec<_>>();
+    released.sort_by_key(|key| (key.is_modifier(), key.to_raw()));
+
+    let mut pressed = desired.difference(current).copied().collect::<Vec<_>>();
+    pressed.sort_by_key(|key| (!key.is_modifier(), key.to_raw()));
+
+    let mut events = released
+        .into_iter()
+        .map(|key| Event::Key(KeyEvent { key, down: false }))
+        .chain(
+            pressed
+                .into_iter()
+                .map(|key| Event::Key(KeyEvent { key, down: true })),
+        )
+        .collect::<Vec<_>>();
+    if !events.is_empty() {
+        events.push(Event::Sync(crate::sync::SyncEvent::All));
+    }
+    events
 }
 
 pub struct WriterBuilder {
@@ -336,6 +390,10 @@ mod tests {
     use crate::key::Keyboard;
     use crate::sync::SyncEvent;
 
+    fn key(key: Keyboard) -> Key {
+        Key::Key(key)
+    }
+
     #[test]
     fn raw_event_preserves_basic_event_order_data() {
         assert_eq!(
@@ -356,5 +414,86 @@ mod tests {
             raw_event(&Event::Sync(SyncEvent::All)),
             Some((glue::EV_SYN as _, glue::SYN_REPORT as _, 0))
         );
+    }
+
+    #[test]
+    fn key_state_delta_releases_plain_keys_before_modifiers() {
+        let current = [
+            key(Keyboard::LeftMeta),
+            key(Keyboard::LeftShift),
+            key(Keyboard::Grave),
+        ]
+        .into_iter()
+        .collect();
+
+        let events = key_state_events(&current, &HashSet::new());
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Key(event) => Some(*event),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                KeyEvent {
+                    key: key(Keyboard::Grave),
+                    down: false,
+                },
+                KeyEvent {
+                    key: key(Keyboard::LeftShift),
+                    down: false,
+                },
+                KeyEvent {
+                    key: key(Keyboard::LeftMeta),
+                    down: false,
+                },
+            ]
+        );
+        assert!(matches!(events.last(), Some(Event::Sync(SyncEvent::All))));
+    }
+
+    #[test]
+    fn key_state_delta_presses_modifiers_before_plain_keys() {
+        let desired = [
+            key(Keyboard::A),
+            key(Keyboard::LeftMeta),
+            key(Keyboard::LeftShift),
+        ]
+        .into_iter()
+        .collect();
+
+        let events = key_state_events(&HashSet::new(), &desired);
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Key(event) => Some(*event),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                KeyEvent {
+                    key: key(Keyboard::LeftShift),
+                    down: true,
+                },
+                KeyEvent {
+                    key: key(Keyboard::LeftMeta),
+                    down: true,
+                },
+                KeyEvent {
+                    key: key(Keyboard::A),
+                    down: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_key_states_need_no_events() {
+        let state = [key(Keyboard::LeftCtrl)].into_iter().collect();
+        assert!(key_state_events(&state, &state).is_empty());
     }
 }

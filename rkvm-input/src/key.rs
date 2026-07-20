@@ -20,6 +20,24 @@ pub enum Key {
     Button(Button),
 }
 
+impl Key {
+    pub fn is_modifier(self) -> bool {
+        matches!(
+            self,
+            Self::Key(
+                Keyboard::LeftAlt
+                    | Keyboard::LeftCtrl
+                    | Keyboard::LeftMeta
+                    | Keyboard::LeftShift
+                    | Keyboard::RightAlt
+                    | Keyboard::RightCtrl
+                    | Keyboard::RightMeta
+                    | Keyboard::RightShift
+            )
+        )
+    }
+}
+
 impl Convert for Key {
     type Raw = u16;
 
@@ -40,5 +58,30 @@ impl Convert for Key {
             Self::Key(key) => key.to_raw(),
             Self::Button(button) => button.to_raw(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_keyboard_modifiers() {
+        for modifier in [
+            Keyboard::LeftAlt,
+            Keyboard::LeftCtrl,
+            Keyboard::LeftMeta,
+            Keyboard::LeftShift,
+            Keyboard::RightAlt,
+            Keyboard::RightCtrl,
+            Keyboard::RightMeta,
+            Keyboard::RightShift,
+        ] {
+            assert!(Key::Key(modifier).is_modifier());
+        }
+
+        assert!(!Key::Key(Keyboard::CapsLock).is_modifier());
+        assert!(!Key::Key(Keyboard::A).is_modifier());
+        assert!(!Key::Button(Button::Left).is_modifier());
     }
 }
