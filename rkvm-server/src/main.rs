@@ -111,6 +111,7 @@ async fn main() -> ExitCode {
     };
 
     let propagate_switch_keys = config.propagate_switch_keys.unwrap_or(true);
+    let consume_switch_buttons = config.consume_switch_buttons.unwrap_or(false);
     let device_whitelist = config.device_whitelist;
     let device_groups = config.device_groups;
 
@@ -121,6 +122,7 @@ async fn main() -> ExitCode {
             &config.password,
             &switch_bindings,
             propagate_switch_keys,
+            consume_switch_buttons,
             device_whitelist,
             device_groups,
             client_queue_size,
@@ -523,6 +525,27 @@ password = "123456789"
         assert_eq!(
             build_switch_bindings(&config).unwrap_err(),
             "switch-bindings entries must contain at least one key"
+        );
+    }
+
+    #[test]
+    fn mouse_button_switch_and_consumption_parse() {
+        let config = config(
+            r#"
+listen = "127.0.0.1:5258"
+switch-bindings = [["left-meta", "grave"], ["b-back"]]
+propagate-switch-keys = true
+consume-switch-buttons = true
+certificate = "/etc/rkvm/certificate.pem"
+key = "/etc/rkvm/key.pem"
+password = "123456789"
+"#,
+        );
+        assert_eq!(config.consume_switch_buttons, Some(true));
+        let bindings = build_switch_bindings(&config).unwrap();
+        assert_eq!(
+            bindings[1].trigger,
+            rkvm_input::key::Key::Button(rkvm_input::key::Button::Back)
         );
     }
 

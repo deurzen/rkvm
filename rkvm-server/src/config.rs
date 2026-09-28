@@ -14,6 +14,7 @@ pub struct Config {
     pub switch_keys: Option<Vec<SwitchKey>>,
     pub switch_bindings: Option<Vec<Vec<SwitchKey>>>,
     pub propagate_switch_keys: Option<bool>,
+    pub consume_switch_buttons: Option<bool>,
     pub device_whitelist: Option<Vec<DeviceMatch>>,
     pub device_groups: Option<Vec<DeviceGroup>>,
     pub client_queue_size: Option<usize>,

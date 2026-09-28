@@ -52,7 +52,12 @@ After installation:
   pressed while `left-ctrl` is already held. At each switch, rkvm releases all keys on inactive outputs and
   reasserts physically held Ctrl, Shift, Alt, and Meta modifiers on the new output. The trigger and other held
   keys remain suppressed until released, preventing the switch chord or an unrelated held key from leaking to
-  the new machine. Prefer stable
+  the new machine. Mouse buttons can also be triggers (for example, `["b-back"]` for
+  `BTN_BACK`). Set `consume-switch-buttons = true` to suppress the press and release of all mouse
+  buttons listed in switch bindings on both outputs, without changing keyboard propagation.
+  This is opt-in; `propagate-switch-keys = true` continues to apply to keyboard keys. Check the
+  evdev code of your mouse: `b-back` is `BTN_BACK`, `side` is `BTN_SIDE`, and `back` is the
+  keyboard `KEY_BACK`. Prefer stable
   `/dev/input/by-id/*-event-kbd` or `/dev/input/by-path/*-event-kbd` symlinks in the whitelist instead of
   `/dev/input/eventN` paths, because event numbers can change between boots. Use
   `rkvm-server /etc/rkvm/server.toml --list-devices` to inspect candidate paths, aliases, source origin,

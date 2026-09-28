@@ -14,6 +14,13 @@ switch-bindings = [
 # trigger are then reasserted on the newly active machine. Optional, defaults
 # to true.
 # propagate-switch-keys = true
+# To consume mouse buttons used in switch bindings (press and release, on
+# both machines) independently of keyboard propagation, enable this option.
+# Only buttons named in switch bindings are affected. Defaults to false.
+# Add e.g. ["b-back"] to switch-bindings for an unmodified mouse trigger.
+# Check the actual evdev code: "b-back" is BTN_BACK; "side" is BTN_SIDE,
+# and "back" (without b-) is the keyboard KEY_BACK.
+# consume-switch-buttons = true
 
 # Per-client server queue size. If a client stops draining this queue, it is
 # disconnected rather than letting it block server input processing.

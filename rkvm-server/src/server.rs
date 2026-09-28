@@ -47,6 +47,7 @@ pub async fn run(
     password: &str,
     switch_bindings: &[SwitchBinding],
     propagate_switch_keys: bool,
+    consume_switch_buttons: bool,
     device_whitelist: Option<Vec<DeviceMatch>>,
     device_groups: Option<Vec<DeviceGroup>>,
     client_queue_size: usize,
@@ -85,7 +86,11 @@ pub async fn run(
     };
     let mut devices = Slab::<Device>::new();
     let mut clients = Slab::<(Sender<_>, SocketAddr)>::new();
-    let mut router = Router::new(switch_bindings, propagate_switch_keys);
+    let mut router = Router::new(
+        switch_bindings,
+        propagate_switch_keys,
+        consume_switch_buttons,
+    );
 
     let (events_sender, mut events_receiver) = mpsc::channel(1);
     let (authenticated_sender, mut authenticated_receiver) = mpsc::channel(32);

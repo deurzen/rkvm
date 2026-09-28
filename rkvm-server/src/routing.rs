@@ -37,6 +37,7 @@ pub(crate) struct Router {
     trigger_bindings: HashMap<Key, Vec<usize>>,
     switch_keys: HashSet<Key>,
     trigger_keys: HashSet<Key>,
+    consumed_buttons: HashSet<Key>,
     propagate_switch_keys: bool,
     active_binding: Option<usize>,
     physical_keys: HashMap<usize, HashSet<Key>>,
@@ -44,7 +45,11 @@ pub(crate) struct Router {
 }
 
 impl Router {
-    pub(crate) fn new(bindings: &[SwitchBinding], propagate_switch_keys: bool) -> Self {
+    pub(crate) fn new(
+        bindings: &[SwitchBinding],
+        propagate_switch_keys: bool,
+        consume_switch_buttons: bool,
+    ) -> Self {
         let mut trigger_bindings = HashMap::<Key, Vec<usize>>::new();
         for (index, binding) in bindings.iter().enumerate() {
             trigger_bindings
@@ -63,6 +68,12 @@ impl Router {
                 .copied()
                 .collect(),
             trigger_keys: bindings.iter().map(|binding| binding.trigger).collect(),
+            consumed_buttons: bindings
+                .iter()
+                .flat_map(|binding| binding.keys.iter())
+                .filter(|key| consume_switch_buttons && matches!(key, Key::Button(_)))
+                .copied()
+                .collect(),
             propagate_switch_keys,
             active_binding: None,
             physical_keys: HashMap::new(),
@@ -81,7 +92,8 @@ impl Router {
         routes: &[Route],
     ) -> Vec<Action> {
         let blocked = pressed_keys
-            .intersection(&self.trigger_keys)
+            .iter()
+            .filter(|key| self.trigger_keys.contains(key) || self.consumed_buttons.contains(key))
             .copied()
             .collect::<HashSet<_>>();
         self.physical_keys.insert(device_id, pressed_keys);
@@ -114,13 +126,16 @@ impl Router {
             .get(&device_id)
             .into_iter()
             .flatten()
-            .filter(|key| match self.active_binding {
-                Some(index) => {
-                    !key.is_modifier()
-                        || **key == self.bindings[index].trigger
-                        || (!self.propagate_switch_keys && self.switch_keys.contains(key))
-                }
-                None => self.trigger_keys.contains(key),
+            .filter(|key| {
+                self.consumed_buttons.contains(key)
+                    || match self.active_binding {
+                        Some(index) => {
+                            !key.is_modifier()
+                                || **key == self.bindings[index].trigger
+                                || (!self.propagate_switch_keys && self.switch_keys.contains(key))
+                        }
+                        None => self.trigger_keys.contains(key),
+                    }
             })
             .copied()
             .collect::<HashSet<_>>();
@@ -201,7 +216,7 @@ impl Router {
 
             if let Some(binding_index) = matched {
                 let old_route = self.current;
-                if self.propagate_switch_keys {
+                if self.propagate_switch_keys && !self.consumed_buttons.contains(&key) {
                     pending.push((old_route, event));
                 }
                 flush_events(device_id, &mut pending, &mut actions);
@@ -213,7 +228,9 @@ impl Router {
                 continue;
             }
 
-            if !self.propagate_switch_keys && self.switch_keys.contains(&key) {
+            if self.consumed_buttons.contains(&key)
+                || (!self.propagate_switch_keys && self.switch_keys.contains(&key))
+            {
                 self.clear_inactive_binding();
                 continue;
             }
@@ -405,6 +422,7 @@ impl Router {
             .iter()
             .filter(|key| {
                 (mode == ReconcileMode::Recovery || key.is_modifier())
+                    && !self.consumed_buttons.contains(key)
                     && !matches!(blocked, Some(keys) if keys.contains(key))
             })
             .copied()
@@ -446,7 +464,7 @@ fn flush_events(device_id: usize, pending: &mut Vec<(Route, Event)>, actions: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rkvm_input::key::Keyboard;
+    use rkvm_input::key::{Button, Keyboard};
 
     fn key(key: Keyboard) -> Key {
         Key::Key(key)
@@ -459,6 +477,13 @@ mod tests {
     fn key_event(keyboard: Keyboard, down: bool) -> Event {
         Event::Key(KeyEvent {
             key: key(keyboard),
+            down,
+        })
+    }
+
+    fn button_event(button: Button, down: bool) -> Event {
+        Event::Key(KeyEvent {
+            key: Key::Button(button),
             down,
         })
     }
@@ -537,6 +562,7 @@ mod tests {
                 binding(&[Keyboard::RightCtrl], Keyboard::RightCtrl),
             ],
             propagate,
+            false,
         )
     }
 
@@ -677,6 +703,127 @@ mod tests {
     }
 
     #[test]
+    fn consumed_mouse_switch_never_reaches_either_output() {
+        let back = Key::Button(Button::Back);
+        let mut router = Router::new(&[SwitchBinding::new([back].into(), back)], true, true);
+        let routes = [0, 1];
+        router.add_device(2, HashSet::new(), &routes);
+
+        for (route, down) in [(1, true), (1, false), (0, true), (0, false)] {
+            let actions =
+                router.process_frame(2, frame([button_event(Button::Back, down)]), &routes);
+            assert_eq!(router.current(), route);
+            assert!(routed_key_events(&actions, 0).is_empty());
+            assert!(routed_key_events(&actions, 1).is_empty());
+            if down {
+                assert!(!set_state(&actions, route, 2).unwrap().contains(&back));
+            }
+        }
+    }
+
+    #[test]
+    fn consumed_mouse_switch_preserves_keyboard_propagation() {
+        let back = Key::Button(Button::Back);
+        let mut router = Router::new(
+            &[
+                binding(&[Keyboard::LeftMeta, Keyboard::Grave], Keyboard::Grave),
+                SwitchBinding::new([back].into(), back),
+            ],
+            true,
+            true,
+        );
+        let routes = [0, 1];
+        router.add_device(2, HashSet::new(), &routes);
+
+        let meta = router.process_frame(2, frame([key_event(Keyboard::LeftMeta, true)]), &routes);
+        assert_eq!(routed_key_events(&meta, 0)[0].key, key(Keyboard::LeftMeta));
+        let grave = router.process_frame(2, frame([key_event(Keyboard::Grave, true)]), &routes);
+        assert_eq!(router.current(), 1);
+        assert_eq!(routed_key_events(&grave, 0)[0].key, key(Keyboard::Grave));
+        assert_eq!(
+            set_state(&grave, 1, 2).unwrap(),
+            &[key(Keyboard::LeftMeta)].into()
+        );
+        router.process_frame(2, frame([key_event(Keyboard::Grave, false)]), &routes);
+        router.process_frame(2, frame([key_event(Keyboard::LeftMeta, false)]), &routes);
+
+        let mouse = router.process_frame(2, frame([button_event(Button::Back, true)]), &routes);
+        assert_eq!(router.current(), 0);
+        assert!(routed_key_events(&mouse, 0).is_empty());
+        assert!(routed_key_events(&mouse, 1).is_empty());
+    }
+
+    #[test]
+    fn consumed_button_is_suppressed_on_recovery_and_until_release() {
+        let back = Key::Button(Button::Back);
+        let mut router = Router::new(&[SwitchBinding::new([back].into(), back)], true, true);
+        let routes = [0, 1];
+        let pressed = [back].into();
+        let added = router.add_device(2, pressed, &routes);
+        assert!(set_state(&added, 0, 2).unwrap().is_empty());
+        assert_eq!(router.current(), 0);
+        let released = router.process_frame(2, frame([button_event(Button::Back, false)]), &routes);
+        assert!(routed_key_events(&released, 0).is_empty());
+        let pressed = router.process_frame(2, frame([button_event(Button::Back, true)]), &routes);
+        assert_eq!(router.current(), 1);
+        assert!(routed_key_events(&pressed, 0).is_empty());
+        let reset = router.reset_device(2, [back].into(), &routes);
+        assert!(set_state(&reset, 1, 2).unwrap().is_empty());
+        let released = router.process_frame(2, frame([button_event(Button::Back, false)]), &routes);
+        assert!(routed_key_events(&released, 1).is_empty());
+    }
+
+    #[test]
+    fn only_switch_buttons_are_consumed() {
+        let back = Key::Button(Button::Back);
+        let mut router = Router::new(&[SwitchBinding::new([back].into(), back)], true, true);
+        router.add_device(2, HashSet::new(), &[0, 1]);
+        let actions = router.process_frame(
+            2,
+            frame([
+                button_event(Button::Left, true),
+                button_event(Button::Back, true),
+            ]),
+            &[0, 1],
+        );
+        assert_eq!(router.current(), 1);
+        assert_eq!(
+            routed_key_events(&actions, 0),
+            vec![KeyEvent {
+                key: Key::Button(Button::Left),
+                down: true
+            }]
+        );
+        assert!(routed_key_events(&actions, 1).is_empty());
+        let actions = router.process_frame(
+            2,
+            frame([
+                button_event(Button::Back, false),
+                button_event(Button::Left, false),
+            ]),
+            &[0, 1],
+        );
+        // The held left button was released during handoff, and its physical
+        // release is suppressed to avoid an unmatched release on the new route.
+        assert!(routed_key_events(&actions, 1).is_empty());
+    }
+
+    #[test]
+    fn mouse_switch_propagation_remains_unchanged_without_opt_in() {
+        let back = Key::Button(Button::Back);
+        let mut router = Router::new(&[SwitchBinding::new([back].into(), back)], true, false);
+        router.add_device(2, HashSet::new(), &[0, 1]);
+        let actions = router.process_frame(2, frame([button_event(Button::Back, true)]), &[0, 1]);
+        assert_eq!(
+            routed_key_events(&actions, 0),
+            vec![KeyEvent {
+                key: back,
+                down: true
+            }]
+        );
+    }
+
+    #[test]
     fn route_loss_rehomes_held_modifiers_locally() {
         let mut router = router(true);
         let routes = [0, 1];
@@ -709,7 +856,11 @@ mod tests {
 
     #[test]
     fn recovery_keeps_complete_switch_gesture_consumed() {
-        let mut router = Router::new(&[binding(&[Keyboard::A, Keyboard::B], Keyboard::B)], true);
+        let mut router = Router::new(
+            &[binding(&[Keyboard::A, Keyboard::B], Keyboard::B)],
+            true,
+            false,
+        );
         router.add_device(5, HashSet::new(), &[0]);
 
         let pressed = [key(Keyboard::A), key(Keyboard::B)].into_iter().collect();
@@ -773,6 +924,7 @@ mod tests {
                     Keyboard::Grave,
                 )],
                 true,
+                false,
             );
             let routes = [0, 1, 2];
             let mut outputs = HashMap::new();
